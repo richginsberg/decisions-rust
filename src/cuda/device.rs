@@ -152,6 +152,10 @@ pub struct Engine {
     pub kernels: Kernels,
     pub weights: DeviceWeights,
     pub workspace: Workspace,
+    /// DECISION_PROFILE=1: time every stage of each pass (with a sync after each, so slower).
+    pub profile: bool,
+    /// The last pass's stage report, for the response's server-timing header.
+    pub last_profile: Option<String>,
 }
 
 pub struct GpuModel {
@@ -161,6 +165,7 @@ pub struct GpuModel {
     budget: Budget,
     max_length: usize,
     engine: Mutex<Engine>,
+    last_profile: Mutex<Option<String>>,
 }
 
 // --- CPU-side conversions -------------------------------------------------------------------------------------
@@ -459,8 +464,12 @@ impl GpuModel {
         let workspace = Workspace::allocate(&stream, &checkpoint, max_tokens, !low_memory)?;
         let (free_after, _) = ctx.mem_get_info()?;
         tracing::info!("Weights and workspace on the device; {:.1} GiB free", free_after as f64 / (1u64 << 30) as f64);
-        let engine = Engine { stream, lt, kernels, weights: weights_on_device, workspace };
-        Ok(Self { checkpoint, low_memory, encoder, budget, max_length, engine: Mutex::new(engine) })
+        let profile = std::env::var("DECISION_PROFILE").is_ok_and(|v| v == "1");
+        if profile {
+            tracing::warn!("DECISION_PROFILE=1: every pass stage is timed with a sync; expect slower passes");
+        }
+        let engine = Engine { stream, lt, kernels, weights: weights_on_device, workspace, profile, last_profile: None };
+        Ok(Self { checkpoint, low_memory, encoder, budget, max_length, engine: Mutex::new(engine), last_profile: Mutex::new(None) })
     }
 }
 
@@ -539,9 +548,16 @@ impl Model for GpuModel {
             std: p.image_std,
         }
     }
+    fn last_profile(&self) -> Option<String> {
+        self.last_profile.lock().clone()
+    }
     fn run_pass(&self, rows: &[&Encoded]) -> Result<Vec<RowAnswers>, PassError> {
         let mut engine = self.engine.lock();
-        forward::run(&mut engine, &self.checkpoint, rows).map_err(|error| match error {
+        let result = forward::run(&mut engine, &self.checkpoint, rows);
+        if let Some(report) = engine.last_profile.take() {
+            *self.last_profile.lock() = Some(report);
+        }
+        result.map_err(|error| match error {
             CudaError::OutOfMemory => PassError::OutOfMemory,
             CudaError::Invalid(message) => PassError::Request(message),
             other => PassError::Internal(other.to_string()),

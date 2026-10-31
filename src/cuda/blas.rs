@@ -11,16 +11,18 @@
 //! - FP8: per-tensor (scale 1) into an f32 accumulator; the per-row activation and per-column weight scales are
 //!   applied by a kernel afterwards, since `OUTER_VEC_32F` is Hopper-only.
 //!
-//! Descriptors are created per call; cuBLASLt caches heuristics, and a pass makes a few hundred calls, so the
-//! descriptor cost is noise next to the matmuls.
+//! Each distinct call (types, shape, scale and bias pointers) keeps its descriptor, layouts and the heuristic's
+//! algorithm after the first time: a pass makes a few hundred calls, and the heuristic query alone is tens of
+//! microseconds each, which is most of a short pass.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::cublaslt::result as lt;
 use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
-
+use parking_lot::Mutex;
 
 use super::CudaError;
 
@@ -54,6 +56,30 @@ pub struct Lt {
     _workspace: CudaSlice<u8>,
     workspace_ptr: *mut c_void,
     stream: Arc<CudaStream>,
+    plans: Mutex<HashMap<Key, Plan>>,
+}
+
+/// What distinguishes one prepared matmul from another: everything but the A, B and D data pointers.
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+struct Key {
+    a_type: i32,
+    out_type: i32,
+    m: usize,
+    n: usize,
+    k: usize,
+    scale_mode: i32,
+    a_scale: usize,
+    b_scale: usize,
+    bias: usize,
+}
+
+/// A prepared matmul: its descriptor, layouts and the algorithm the heuristic chose.
+struct Plan {
+    desc: Desc,
+    a: Layout,
+    b: Layout,
+    d: Layout,
+    algo: sys::cublasLtMatmulAlgo_t,
 }
 
 unsafe impl Send for Lt {}
@@ -135,14 +161,14 @@ impl Lt {
             let (ptr, _record) = workspace.device_ptr(&stream);
             ptr as *mut c_void
         };
-        Ok(Self { handle, _workspace: workspace, workspace_ptr, stream })
+        Ok(Self { handle, _workspace: workspace, workspace_ptr, stream, plans: Mutex::new(HashMap::new()) })
     }
 
-    /// The common part of every call: `D[N x M] = alpha · A^T[N x K] · B[K x M]` in column-major terms.
+    /// The common part of every call: `D[N x M] = alpha · A^T[N x K] · B[K x M]` in column-major terms. `scales`
+    /// is the block-scale mode with the A and B scale pointers, for the narrow types.
     #[allow(clippy::too_many_arguments)]
     unsafe fn run(
         &self,
-        desc: &Desc,
         a: (*const c_void, sys::cudaDataType, i64),
         b: (*const c_void, sys::cudaDataType, i64),
         out: (*mut c_void, sys::cudaDataType),
@@ -150,20 +176,87 @@ impl Lt {
         n: usize,
         k: usize,
         alpha: f32,
-        beta: f32,
+        scales: Option<(sys::cublasLtMatmulMatrixScale_t, *const c_void, *const c_void)>,
         bias: Option<*const c_void>,
     ) -> Result<(), CudaError> {
         let blas = |e: cudarc::cublaslt::result::CublasError, what: &str| CudaError::Blas(format!("{what}: {e:?}"));
+        let key = Key {
+            a_type: a.1 as i32,
+            out_type: out.1 as i32,
+            m,
+            n,
+            k,
+            scale_mode: scales.map_or(-1, |(mode, _, _)| mode as i32),
+            a_scale: scales.map_or(0, |(_, p, _)| p as usize),
+            b_scale: scales.map_or(0, |(_, _, p)| p as usize),
+            bias: bias.map_or(0, |p| p as usize),
+        };
+        let mut plans = self.plans.lock();
+        let plan = match plans.get(&key) {
+            Some(plan) => plan,
+            None => {
+                let plan = unsafe { self.prepare(a, b, out, m, n, k, scales, bias) }?;
+                plans.entry(key).or_insert(plan)
+            }
+        };
+        let beta = 0.0f32;
         unsafe {
+            lt::matmul(
+                self.handle,
+                plan.desc.0,
+                &alpha as *const f32 as *const c_void,
+                &beta as *const f32 as *const c_void,
+                a.0,
+                plan.a.0,
+                b.0,
+                plan.b.0,
+                out.0 as *const c_void,
+                plan.d.0,
+                out.0,
+                plan.d.0,
+                &plan.algo,
+                self.workspace_ptr,
+                WORKSPACE_BYTES,
+                self.stream.cu_stream() as sys::cudaStream_t,
+            )
+            .map_err(|e| blas(e, &format!("cublasLtMatmul {m}x{n}x{k} {:?}", a.1)))
+        }
+    }
+
+    /// The descriptor, layouts and algorithm for one distinct call.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn prepare(
+        &self,
+        a: (*const c_void, sys::cudaDataType, i64),
+        b: (*const c_void, sys::cudaDataType, i64),
+        out: (*mut c_void, sys::cudaDataType),
+        m: usize,
+        n: usize,
+        k: usize,
+        scales: Option<(sys::cublasLtMatmulMatrixScale_t, *const c_void, *const c_void)>,
+        bias: Option<*const c_void>,
+    ) -> Result<Plan, CudaError> {
+        let blas = |e: cudarc::cublaslt::result::CublasError, what: &str| CudaError::Blas(format!("{what}: {e:?}"));
+        unsafe {
+            let desc = Desc(
+                lt::create_matmul_desc(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, sys::cudaDataType_t::CUDA_R_32F)
+                    .map_err(|e| blas(e, "matmul desc"))?,
+            );
             // cublasOperation_t: CUBLAS_OP_N = 0, CUBLAS_OP_T = 1 (a C enum, 4 bytes).
             let trans_t: i32 = 1;
             let trans_n: i32 = 0;
-            set_desc(desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &trans_t)?;
-            set_desc(desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &trans_n)?;
+            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &trans_t)?;
+            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &trans_n)?;
+            if let Some((mode, a_scale, b_scale)) = scales {
+                set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode)?;
+                set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode)?;
+                set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale)?;
+                set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale)?;
+            }
             if let Some(bias) = bias {
                 let epilogue = sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
-                set_desc(desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue)?;
-                set_desc(desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias)?;
+                set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue)?;
+                set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias)?;
             }
             // A: the weight, stored [N, K] row-major = column-major [K, N] with ld = K (in elements of its type).
             let a_layout = Layout(lt::create_matrix_layout(a.1, k as u64, n as u64, a.2).map_err(|e| blas(e, "A layout"))?);
@@ -182,25 +275,7 @@ impl Lt {
             .map_err(|e| blas(e, "workspace preference"))?;
             let heuristic = lt::get_matmul_algo_heuristic(self.handle, desc.0, a_layout.0, b_layout.0, d_layout.0, d_layout.0, pref.0)
                 .map_err(|e| blas(e, &format!("no cuBLASLt algorithm for {m}x{n}x{k} {:?}", a.1)))?;
-            lt::matmul(
-                self.handle,
-                desc.0,
-                &alpha as *const f32 as *const c_void,
-                &beta as *const f32 as *const c_void,
-                a.0,
-                a_layout.0,
-                b.0,
-                b_layout.0,
-                out.0 as *const c_void,
-                d_layout.0,
-                out.0,
-                d_layout.0,
-                &heuristic.algo,
-                self.workspace_ptr,
-                WORKSPACE_BYTES,
-                self.stream.cu_stream() as sys::cudaStream_t,
-            )
-            .map_err(|e| blas(e, &format!("cublasLtMatmul {m}x{n}x{k} {:?}", a.1)))
+            Ok(Plan { desc, a: a_layout, b: b_layout, d: d_layout, algo: heuristic.algo })
         }
     }
 
@@ -218,26 +293,15 @@ impl Lt {
         // the rows beyond the real ones hold stale values whose outputs nothing reads.
         let m = m.div_ceil(16) * 16;
         debug_assert!(x_packed.len() >= m * k / 2 && out.len() >= m * n);
-        let desc = Desc(
-            lt::create_matmul_desc(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, sys::cudaDataType_t::CUDA_R_32F)
-                .map_err(|e| CudaError::Blas(format!("matmul desc: {e:?}")))?,
-        );
         unsafe {
             let mode = sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
-            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode)?;
-            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode)?;
             let (w_scale, _r1) = w.scale.device_ptr(&self.stream);
             let (x_scale_ptr, _r2) = x_scale.device_ptr(&self.stream);
-            let w_scale = w_scale as *const c_void;
-            let x_scale_ptr = x_scale_ptr as *const c_void;
-            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_scale)?;
-            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &x_scale_ptr)?;
             let (w_ptr, _r3) = w.packed.device_ptr(&self.stream);
             let (x_ptr, _r4) = x_packed.device_ptr(&self.stream);
             let (out_ptr, _r5) = out.device_ptr_mut(&self.stream);
             // Leading dimensions of FP4 layouts count elements (two per byte).
             self.run(
-                &desc,
                 (w_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_4F_E2M1, k as i64),
                 (x_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_4F_E2M1, k as i64),
                 (out_ptr as *mut c_void, sys::cudaDataType_t::CUDA_R_16BF),
@@ -245,7 +309,7 @@ impl Lt {
                 n,
                 k,
                 w.decode / w.input_encode,
-                0.0,
+                Some((mode, w_scale as *const c_void, x_scale_ptr as *const c_void)),
                 None,
             )
         }
@@ -266,16 +330,11 @@ impl Lt {
         let (n, k) = (w.n, w.k);
         let m = m.div_ceil(16) * 16;
         debug_assert!(x_values.len() >= m * k && acc.len() >= m * n);
-        let desc = Desc(
-            lt::create_matmul_desc(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, sys::cudaDataType_t::CUDA_R_32F)
-                .map_err(|e| CudaError::Blas(format!("matmul desc: {e:?}")))?,
-        );
         unsafe {
             let (w_ptr, _r3) = w.values.device_ptr(&self.stream);
             let (x_ptr, _r4) = x_values.device_ptr(&self.stream);
             let (acc_ptr, _r5) = acc.device_ptr_mut(&self.stream);
             self.run(
-                &desc,
                 (w_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_8F_E4M3, k as i64),
                 (x_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_8F_E4M3, k as i64),
                 (acc_ptr as *mut c_void, sys::cudaDataType_t::CUDA_R_32F),
@@ -283,7 +342,7 @@ impl Lt {
                 n,
                 k,
                 1.0,
-                0.0,
+                None,
                 None,
             )
         }
@@ -293,10 +352,6 @@ impl Lt {
     pub fn bf16(&self, x: &CudaSlice<u16>, w: &Bf16Weight, out: &mut CudaSlice<u16>, m: usize) -> Result<(), CudaError> {
         let (n, k) = (w.n, w.k);
         debug_assert!(x.len() >= m * k && out.len() >= m * n);
-        let desc = Desc(
-            lt::create_matmul_desc(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, sys::cudaDataType_t::CUDA_R_32F)
-                .map_err(|e| CudaError::Blas(format!("matmul desc: {e:?}")))?,
-        );
         unsafe {
             let (w_ptr, _r1) = w.values.device_ptr(&self.stream);
             let (x_ptr, _r2) = x.device_ptr(&self.stream);
@@ -306,7 +361,6 @@ impl Lt {
                 p as *const c_void
             });
             self.run(
-                &desc,
                 (w_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_16BF, k as i64),
                 (x_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_16BF, k as i64),
                 (out_ptr as *mut c_void, sys::cudaDataType_t::CUDA_R_16BF),
@@ -314,7 +368,7 @@ impl Lt {
                 n,
                 k,
                 1.0,
-                0.0,
+                None,
                 bias,
             )
         }
@@ -324,16 +378,11 @@ impl Lt {
     pub fn bf16_to_f32(&self, x: &CudaSlice<u16>, w: &Bf16Weight, out: &mut CudaSlice<f32>, m: usize) -> Result<(), CudaError> {
         let (n, k) = (w.n, w.k);
         debug_assert!(x.len() >= m * k && out.len() >= m * n && w.bias.is_none());
-        let desc = Desc(
-            lt::create_matmul_desc(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, sys::cudaDataType_t::CUDA_R_32F)
-                .map_err(|e| CudaError::Blas(format!("matmul desc: {e:?}")))?,
-        );
         unsafe {
             let (w_ptr, _r1) = w.values.device_ptr(&self.stream);
             let (x_ptr, _r2) = x.device_ptr(&self.stream);
             let (out_ptr, _r3) = out.device_ptr_mut(&self.stream);
             self.run(
-                &desc,
                 (w_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_16BF, k as i64),
                 (x_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_16BF, k as i64),
                 (out_ptr as *mut c_void, sys::cudaDataType_t::CUDA_R_32F),
@@ -341,7 +390,7 @@ impl Lt {
                 n,
                 k,
                 1.0,
-                0.0,
+                None,
                 None,
             )
         }

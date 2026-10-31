@@ -215,7 +215,7 @@ async fn models(State(service): State<AppState>, headers: HeaderMap) -> Result<J
         "description": "Local pplx-decider text and image decisions.", "release_date": service.release_date})).collect::<Vec<_>>()})))
 }
 
-async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
+async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     authenticate(&service, &headers)?;
     let (Some(model), Some(batcher)) = (&service.model, &service.batcher) else {
         return Err(ApiError::new(503, "The model is not ready."));
@@ -249,8 +249,14 @@ async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes
             );
             let answers: serde_json::Map<String, Value> =
                 decision.answers.into_iter().map(|(key, answer)| (key, serde_json::to_value(answer).unwrap_or(Value::Null))).collect();
-            Ok(Json(json!({"model": service.name, "answers": answers,
-                "usage": {"input_tokens": decision.input_tokens, "output_tokens": 0, "sequences": decision.sequences}})))
+            let mut response = Json(json!({"model": service.name, "answers": answers,
+                "usage": {"input_tokens": decision.input_tokens, "output_tokens": 0, "sequences": decision.sequences}})).into_response();
+            if let Some(profile) = model.last_profile()
+                && let Ok(value) = HeaderValue::from_str(&profile)
+            {
+                response.headers_mut().insert("server-timing", value);
+            }
+            Ok(response)
         }
         Outcome::Failed(failure) => Err(ApiError::from_failure(failure)),
     }
@@ -280,7 +286,9 @@ async fn request_metadata(request: axum::extract::Request, next: middleware::Nex
         headers.insert("x-typesafe-request-id", value.clone());
         headers.insert("x-request-id", value);
     }
-    if let Ok(value) = HeaderValue::from_str(&format!("total;dur={:.1}", started.elapsed().as_secs_f64() * 1000.0)) {
+    // The handler may have put the pass's stage timings there already; the total goes in front.
+    let stages = headers.get("server-timing").and_then(|v| v.to_str().ok()).map(|v| format!(", {v}")).unwrap_or_default();
+    if let Ok(value) = HeaderValue::from_str(&format!("total;dur={:.1}{stages}", started.elapsed().as_secs_f64() * 1000.0)) {
         headers.insert("server-timing", value);
     }
     response

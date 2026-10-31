@@ -13,6 +13,7 @@
 //! Finally the marker rows are gathered, normed, and multiplied by the readout; the softmax with the saved
 //! temperature happens on the CPU over each question's own options.
 
+use cudarc::driver::CudaStream;
 use super::CudaError;
 use super::device::{Embeddings, Engine, Mixer};
 use super::kernels::{ATTENTION_QUERIES, DELTA_CHUNK, Ptr};
@@ -127,6 +128,7 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
         return Err(CudaError::Invalid(format!("a pass of {n} tokens exceeds the workspace of {}", engine.workspace.max_tokens)));
     }
     let stream = engine.stream.clone();
+    let mut timer = Timer::new(engine.profile, &stream);
     let eps = text.rms_norm_eps as f32;
     let hidden = text.hidden_size;
 
@@ -143,8 +145,10 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
         return Err(CudaError::Invalid("too many sequences for the delta-rule workspace".into()));
     }
 
+    timer.tick("inputs");
+
     // Embeddings.
-    let Engine { stream: _, lt, kernels, weights, workspace: ws } = engine;
+    let Engine { stream: _, lt, kernels, weights, workspace: ws, profile: _, last_profile } = engine;
     match &weights.embeddings {
         Embeddings::Device(table) => kernels.gather_rows(table, &ids, &mut ws.h, n, hidden)?,
         Embeddings::Host { weights: host, name } => {
@@ -171,7 +175,9 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
         }
         let image_tokens = stream.clone_htod(&pack.image_tokens)?;
         kernels.scatter_rows(&ws.vembeds, &image_tokens, &mut ws.h, merged, hidden)?;
+        timer.tick("vision");
     }
+    timer.tick("embed");
 
     // The layers.
     for layer in &weights.layers {
@@ -180,47 +186,74 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
                 let qkv_dim = lin.qkv.n;
                 let v_dim = lin.z.n;
                 kernels.rms_norm(&ws.h, None, &layer.input_norm, &mut ws.normed, n, hidden, eps)?;
+                timer.tick("norm");
                 kernels.quantize_fp8(&ws.normed, &mut ws.fp8_values, &mut ws.fp8_scales, n, hidden)?;
+                timer.tick("quant8");
                 lt.fp8(&ws.fp8_values, &lin.qkv, &mut ws.fp8_acc, n)?;
+                timer.tick("fp8mm");
                 kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.qkv.scale, &mut ws.wide, n, qkv_dim)?;
+                timer.tick("rescale");
                 lt.fp8(&ws.fp8_values, &lin.z, &mut ws.fp8_acc, n)?;
+                timer.tick("fp8mm");
                 kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.z.scale, &mut ws.z, n, v_dim)?;
+                timer.tick("rescale");
                 lt.bf16(&ws.normed, &lin.ab, &mut ws.ab, n)?;
+                timer.tick("bf16mm");
                 kernels.conv1d_silu(&ws.wide, &lin.conv, &seq_of, &mut ws.mid, n, qkv_dim)?;
+                timer.tick("conv");
                 kernels.delta_chunk(&delta_chunks, n_chunks, &ws.mid, &ws.ab, &lin.a_log_exp, &lin.dt_bias, &mut ws.new_values, &mut ws.k_cumdecay, &mut ws.intra, &mut ws.cum_decay)?;
+                timer.tick("delta.chunk");
                 kernels.delta_state(&delta_seqs, pack.seqs.len(), &delta_chunks, &ws.mid, &ws.new_values, &ws.k_cumdecay, &ws.intra, &ws.cum_decay, &mut ws.mixed)?;
+                timer.tick("delta.chunk");
                 // mixed holds the delta-rule output [N, 48, 128]; the gated norm writes out_proj's input (into
                 // `wide`, whose qkv the conv has consumed).
                 kernels.gated_norm(&ws.mixed, &ws.z, &lin.norm, &mut ws.wide, n, eps)?;
+                timer.tick("gnorm");
                 kernels.quantize_fp8(&ws.wide, &mut ws.fp8_values, &mut ws.fp8_scales, n, v_dim)?;
+                timer.tick("quant8");
                 lt.fp8(&ws.fp8_values, &lin.out, &mut ws.fp8_acc, n)?;
+                timer.tick("fp8mm");
                 kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.out.scale, &mut ws.out, n, hidden)?;
+                timer.tick("rescale");
             }
             Mixer::Full(full) => {
                 let heads = text.num_attention_heads;
                 let kv_heads = text.num_key_value_heads;
                 let head_dim = text.head_dim;
                 kernels.rms_norm(&ws.h, None, &layer.input_norm, &mut ws.normed, n, hidden, eps)?;
+                timer.tick("norm");
                 // q, k and v share the normed input; it is quantized once per distinct input scale.
                 let mut quantized_for = f32::NAN;
                 fp4_project(kernels, lt, &stream, &ws.normed, &mut ws.fp4_packed, &mut ws.fp4_scales, &mut quantized_for, &full.q, &mut ws.wide, n, hidden)?;
+                timer.tick("fp4mm");
                 fp4_project(kernels, lt, &stream, &ws.normed, &mut ws.fp4_packed, &mut ws.fp4_scales, &mut quantized_for, &full.k, &mut ws.mid, n, hidden)?;
+                timer.tick("fp4mm");
                 fp4_project(kernels, lt, &stream, &ws.normed, &mut ws.fp4_packed, &mut ws.fp4_scales, &mut quantized_for, &full.v, &mut ws.v, n, hidden)?;
+                timer.tick("fp4mm");
                 let rot = text.rotary_dim();
                 kernels.head_norm_rotary(&ws.wide, &ws.mid, &full.q_norm, &full.k_norm, &positions, &mut ws.z, &mut ws.k_rot, n, heads, kv_heads, rot, text.rope_parameters.rope_theta as f32, eps)?;
+                timer.tick("rope");
                 let gate = Ptr::of(&ws.wide, head_dim, &stream);
                 let scale = 1.0 / (head_dim as f32).sqrt();
                 kernels.attention(&attn_tiles, n_tiles, &ws.z, &ws.k_rot, &ws.v, gate, &mut ws.mixed, heads, kv_heads, scale)?;
+                timer.tick("attention");
                 kernels.quantize_fp4(Ptr::of(&ws.mixed, 0, &stream), &mut ws.fp4_packed, &mut ws.fp4_scales, n, heads * head_dim, full.o.input_encode)?;
+                timer.tick("quant4");
                 lt.fp4(&ws.fp4_packed, &ws.fp4_scales, &full.o, &mut ws.out, n)?;
+                timer.tick("fp4mm");
             }
         }
         // h += out; x = rms_norm(h) -> fp4; gate|up; silu * up -> fp4; down; h += mlp.
         kernels.rms_norm_fp4(&ws.out, Some(&mut ws.h), &layer.post_norm, &mut ws.fp4_packed, &mut ws.fp4_scales, n, hidden, eps, layer.gate_up.input_encode)?;
+        timer.tick("norm");
         lt.fp4(&ws.fp4_packed, &ws.fp4_scales, &layer.gate_up, &mut ws.wide, n)?;
+        timer.tick("fp4mm");
         kernels.silu_mul_fp4(&ws.wide, &mut ws.fp4_packed, &mut ws.fp4_scales, n, text.intermediate_size, layer.down.input_encode)?;
+        timer.tick("silu");
         lt.fp4(&ws.fp4_packed, &ws.fp4_scales, &layer.down, &mut ws.out, n)?;
+        timer.tick("fp4mm");
         kernels.add_inplace(&mut ws.h, &ws.out, n * hidden)?;
+        timer.tick("add");
     }
 
     // Readout at the markers.
@@ -234,6 +267,11 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
     let mut host = vec![0f32; m * options];
     stream.memcpy_dtoh(&logits, &mut host)?;
     stream.synchronize()?;
+    timer.tick("readout");
+    if let Some(report) = timer.report(n) {
+        tracing::info!("{report}");
+        *last_profile = Some(report);
+    }
 
     let temperature = checkpoint.decision.temperature as f32;
     let mut cursor = 0;
@@ -248,6 +286,42 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
         answers.push(row_answers);
     }
     Ok(answers)
+}
+
+/// Per-stage GPU time of a pass (DECISION_PROFILE=1): a stream sync after every stage, so only for profiling.
+struct Timer<'a> {
+    stream: Option<&'a CudaStream>,
+    last: std::time::Instant,
+    stages: Vec<(&'static str, f64)>,
+}
+
+impl<'a> Timer<'a> {
+    fn new(enabled: bool, stream: &'a CudaStream) -> Self {
+        Self { stream: enabled.then_some(stream), last: std::time::Instant::now(), stages: Vec::new() }
+    }
+
+    fn tick(&mut self, stage: &'static str) {
+        let Some(stream) = self.stream else { return };
+        let _ = stream.synchronize();
+        let now = std::time::Instant::now();
+        let ms = (now - self.last).as_secs_f64() * 1000.0;
+        self.last = now;
+        match self.stages.iter_mut().find(|(name, _)| *name == stage) {
+            Some((_, total)) => *total += ms,
+            None => self.stages.push((stage, ms)),
+        }
+    }
+
+    /// `server-timing` entries, largest first: `fp4mm;dur=123.4, ...`.
+    fn report(&self, tokens: usize) -> Option<String> {
+        self.stream?;
+        let mut stages = self.stages.clone();
+        stages.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let total: f64 = stages.iter().map(|(_, ms)| ms).sum();
+        let mut parts = vec![format!("pass;dur={total:.1};desc=\"{tokens} tokens\"")];
+        parts.extend(stages.iter().map(|(name, ms)| format!("{name};dur={ms:.1}")));
+        Some(parts.join(", "))
+    }
 }
 
 fn engine_image_pad(checkpoint: &Checkpoint) -> u32 {

@@ -66,6 +66,10 @@ pub trait Model: Send + Sync {
     /// One forward pass over sequences, one result per row in order. Rows are independent, so each gets
     /// the answers it would get alone.
     fn run_pass(&self, rows: &[&Encoded]) -> Result<Vec<RowAnswers>, PassError>;
+    /// The last pass's per-stage timing, when profiling is on (see DECISION_PROFILE).
+    fn last_profile(&self) -> Option<String> {
+        None
+    }
 }
 
 pub type SharedModel = Arc<dyn Model>;
