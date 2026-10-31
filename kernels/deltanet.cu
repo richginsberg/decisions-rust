@@ -1,30 +1,42 @@
-// The gated delta rule of Qwen3.5's linear-attention layers, as transformers' chunked reference
-// (torch_chunk_gated_delta_rule, chunk size 64, fp32) computes it, over packed sequences.
+// The gated delta rule of Qwen3.5's linear-attention layers over packed sequences, on the tensor cores, in the
+// structure of flash-linear-attention's chunk_gated_delta_rule (chunk size 64), which the Python server runs:
 //
-// Per value head h (48) and token t, with q, k from key head h / 3, all in fp32:
+// Per value head h (48) and token t, with q, k from key head h / 3:
 //   q_t = l2norm(q_t) / sqrt(128),  k_t = l2norm(k_t),  beta_t = sigmoid(b_t),
 //   g_t = -exp(A_log_h) * softplus(a_t + dt_bias_h)
 //   S_t = exp(g_t) S_{t-1} (I - beta_t k_t k_t^T) + beta_t k_t v_t^T,   o_t = S_t^T q_t
 //
-// Two kernels:
-// - `delta_chunk` (one block per chunk of 64 tokens per head): the within-chunk quantities that don't depend on
-//   the state: cumulative decays, the unit-lower-triangular solves giving `new_values` and `k_cumdecay`, and the
-//   intra-chunk attention matrix. l2norm and the decays are recomputed from the conv output rather than stored.
-// - `delta_state` (one block per sequence per head per 64-column half of the state): walks the chunks in order
-//   with S (128 x 64 per block) in registers, producing the outputs.
+// Three kernels, with cum = the cumulative sum of g inside the chunk:
+// - `delta_chunk` (one block per chunk per head, parallel): the within-chunk quantities that don't depend on
+//   the state. A = (k k^T) ⊙ beta_i exp(cum_i - cum_j), strictly lower; u = (I + A)^-1 (v beta) and
+//   w = (I + A)^-1 (k beta exp(cum)) by forward substitution in fp32; the masked intra-chunk attention
+//   at = (q k^T) ⊙ exp(cum_i - cum_j) / sqrt(128) for j <= i.
+// - `delta_state` (one block per sequence per head, sequential over its chunks): keeps S^T (128 x 128) in
+//   registers as mma accumulators, stores it per chunk, forms v_new = u - w S and advances
+//   S = exp(cum_last) S + (k exp(cum_last - cum))^T v_new.
+// - `delta_out` (one block per chunk per head, parallel): o = (q exp(cum) / sqrt(128)) S_chunk + at v_new.
+//
+// Products run in bf16 with fp32 accumulation, as fla's tl.dot does; the state and v_new are stored in bf16
+// between kernels, as fla stores them.
 //
 // Inputs come straight from the conv output [N, 10240] bf16 (q | k | v) and the a/b projection output [N, 96]
 // bf16 (a | b). Padding tokens of a chunk (beyond the sequence) act as zeros: q = k = v = 0, beta = 0, g = 0.
+//
+// Fragment layouts (g = lane / 4, t = lane % 4): see attention.cu. An operand stored [rows][k] row-major in
+// shared memory serves as A (rows = m) or as B (rows = n), so every product below stores its B operand
+// transposed, [n][k].
 
 #include "common.cuh"
 
 #define CHUNK 64
 #define DK 128
 #define DV 128
-#define KV_HEADS 16
 #define V_HEADS 48
 #define QKV_STRIDE 10240
 #define AB_STRIDE 96
+// Shared-memory row strides (bf16 elements), padded so fragment loads are bank-conflict free.
+#define QS 136
+#define TS 72
 
 struct DeltaChunk {
     uint32_t seq_start; // first token of the sequence
@@ -53,8 +65,7 @@ __device__ __forceinline__ float beta_of(const bf16* __restrict__ ab, uint32_t t
     return sigmoid(bf2f(ab[(size_t)tok * AB_STRIDE + V_HEADS + h]));
 }
 
-// Load a token's q (or k) vector of key head kh, l2-normalized, into `v` (128 values); the caller multiplies
-// q by 1/sqrt(128). Each of 32 lanes holds 4 values: lane l holds dims 4l..4l+3.
+// Load a token's q (or k) vector of key head kh, l2-normalized, into `v4`: lane l holds dims 4l..4l+3.
 __device__ __forceinline__ void load_l2norm_lane(const bf16* __restrict__ qkv, uint32_t tok, uint32_t offset,
                                                  uint32_t kh, float* v4) {
     const bf16* p = qkv + (size_t)tok * QKV_STRIDE + offset + kh * DK + (threadIdx.x & 31) * 4;
@@ -69,18 +80,41 @@ __device__ __forceinline__ void load_l2norm_lane(const bf16* __restrict__ qkv, u
     for (int i = 0; i < 4; i++) v4[i] *= inv;
 }
 
-// Block: 256 threads = 8 warps. Smem: k [64][128] f32, ut [64][64] f32 (strict lower part used), attn [64][64].
-#define DELTA_CHUNK_SMEM ((CHUNK * DK + 2 * CHUNK * CHUNK) * 4)
+// Lane l's 4 values of a row, scaled, as 4 bf16 at `row + 4l`.
+__device__ __forceinline__ void store_lane4(bf16* row, const float* v4, float scale) {
+    uint2 packed;
+    packed.x = pack_bf16(v4[0] * scale, v4[1] * scale);
+    packed.y = pack_bf16(v4[2] * scale, v4[3] * scale);
+    *reinterpret_cast<uint2*>(row + (threadIdx.x & 31) * 4) = packed;
+}
+
+// Copy `rows` rows of `width` bf16 (a multiple of 8) from a global row-major buffer into shared memory with
+// row stride `stride`; rows at or beyond `valid` are zero.
+__device__ __forceinline__ void stage_rows(bf16* smem, int stride, const bf16* __restrict__ src, size_t src_stride,
+                                           int rows, int width, int valid) {
+    const int per_row = width / 8;
+    for (int i = threadIdx.x; i < rows * per_row; i += blockDim.x) {
+        const int row = i / per_row, c8 = (i % per_row) * 8;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (row < valid) v = *reinterpret_cast<const uint4*>(src + (size_t)row * src_stride + c8);
+        *reinterpret_cast<uint4*>(smem + row * stride + c8) = v;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// delta_chunk: block (chunk, head) of 256 threads = 8 warps.
+// Shared: q [64][QS] bf16, k [64][QS] bf16, A [64][64] f32.
+#define DELTA_CHUNK_SMEM (2 * CHUNK * QS * 2 + CHUNK * CHUNK * 4)
 
 extern "C" __global__ void delta_chunk(const DeltaChunk* __restrict__ chunks, const bf16* __restrict__ qkv,
                                        const bf16* __restrict__ ab, const float* __restrict__ a_log_exp,
-                                       const float* __restrict__ dt_bias, float* __restrict__ new_values,
-                                       float* __restrict__ k_cumdecay, float* __restrict__ intra,
+                                       const float* __restrict__ dt_bias, bf16* __restrict__ u_out,
+                                       bf16* __restrict__ w_out, bf16* __restrict__ intra,
                                        float* __restrict__ cum_decay) {
-    extern __shared__ float smem[];
-    float* ks = smem;                       // [64][128]
-    float* ut = ks + CHUNK * DK;            // [64][64]
-    float* at = ut + CHUNK * CHUNK;         // [64][64]
+    extern __shared__ __align__(16) unsigned char dsmem[];
+    bf16* qs = reinterpret_cast<bf16*>(dsmem);
+    bf16* ks = qs + CHUNK * QS;
+    float* ut = reinterpret_cast<float*>(ks + CHUNK * QS);
     __shared__ float cum[CHUNK];
     __shared__ float beta[CHUNK];
 
@@ -88,7 +122,7 @@ extern "C" __global__ void delta_chunk(const DeltaChunk* __restrict__ chunks, co
     const uint32_t h = blockIdx.y, kh = h / 3;
     const uint32_t remaining = c.seq_len - c.chunk_start; // tokens of this chunk inside the sequence
     const uint32_t tok0 = c.seq_start + c.chunk_start;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
 
     // Decays and betas, cumulative decay (a scan over 64 values by one warp).
     if (warp == 0) {
@@ -107,152 +141,287 @@ extern "C" __global__ void delta_chunk(const DeltaChunk* __restrict__ chunks, co
         beta[lane] = b0;
         beta[lane + 32] = b1;
     }
-    // k rows (l2-normalized) into smem: warp w loads rows w, w+8, ...
+    // q and k rows (l2-normalized) as bf16: warp w loads rows w, w + 8, ...
     for (int row = warp; row < CHUNK; row += 8) {
-        float v4[4] = {0.f, 0.f, 0.f, 0.f};
-        if ((uint32_t)row < remaining) load_l2norm_lane(qkv, tok0 + row, 2048, kh, v4);
-#pragma unroll
-        for (int i = 0; i < 4; i++) ks[row * DK + lane * 4 + i] = v4[i];
+        float q4[4] = {0.f, 0.f, 0.f, 0.f}, k4[4] = {0.f, 0.f, 0.f, 0.f};
+        if ((uint32_t)row < remaining) {
+            load_l2norm_lane(qkv, tok0 + row, 0, kh, q4);
+            load_l2norm_lane(qkv, tok0 + row, 2048, kh, k4);
+        }
+        store_lane4(qs + row * QS, q4, 1.f);
+        store_lane4(ks + row * QS, k4, 1.f);
     }
     __syncthreads();
-    // cum_decay out: [N][48]
     for (int i = threadIdx.x; i < CHUNK; i += blockDim.x)
         if ((uint32_t)i < remaining) cum_decay[(size_t)(tok0 + i) * V_HEADS + h] = cum[i];
 
-    // ut[i][j] = beta_i (k_i . k_j) exp(cum_i - cum_j) for j < i; attn[i][j] = (q_i . k_j) exp(cum_i - cum_j) for j <= i.
-    // Each warp takes rows i = warp, warp + 8, ...; lanes split the columns j.
-    for (int i = warp; i < CHUNK; i += 8) {
-        float q4[4] = {0.f, 0.f, 0.f, 0.f};
-        if ((uint32_t)i < remaining) load_l2norm_lane(qkv, tok0 + i, 0, kh, q4);
-        const float qscale = rsqrtf((float)DK);
-        // For each column j, every lane contributes its 4 dims of row i and row j, then the warp reduces.
-        for (int j = 0; j < CHUNK; j++) {
-            float kk = 0.f, qk = 0.f;
+    // kk = k k^T and qk = q k^T (64 x 64 each): warp w takes row tile w / 2 and column tiles 4 (w % 2) .. + 4.
+    const int mt = warp >> 1, nb = (warp & 1) * 4;
+    float kk[4][4], qk[4][4];
 #pragma unroll
-            for (int d = 0; d < 4; d++) {
-                const float kj = ks[j * DK + lane * 4 + d];
-                kk += ks[i * DK + lane * 4 + d] * kj;
-                qk += q4[d] * kj;
-            }
-            kk = warp_sum(kk);
-            qk = warp_sum(qk);
-            if (lane == 0) {
+    for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) { kk[nt][e] = 0.f; qk[nt][e] = 0.f; }
+#pragma unroll
+    for (int kstep = 0; kstep < DK / 16; kstep++) {
+        uint32_t aq[4], ak[4];
+        load_a_frag(aq, qs, QS, mt * 16, kstep * 16, g, t);
+        load_a_frag(ak, ks, QS, mt * 16, kstep * 16, g, t);
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            uint32_t b[2];
+            load_b_frag(b, ks, QS, (nb + nt) * 8, kstep * 16, g, t);
+            mma_bf16(kk[nt], ak, b);
+            mma_bf16(qk[nt], aq, b);
+        }
+    }
+    // A (strictly lower, f32, for the solves) and at (lower incl. diagonal, bf16, for delta_out).
+    const float qscale = rsqrtf((float)DK);
+    bf16* at_out = intra + ((size_t)blockIdx.x * V_HEADS + h) * CHUNK * CHUNK;
+#pragma unroll
+    for (int nt = 0; nt < 4; nt++) {
+#pragma unroll
+        for (int half = 0; half < 2; half++) {
+            const int i = mt * 16 + g + half * 8, j0 = (nb + nt) * 8 + 2 * t;
+            float a2[2];
+#pragma unroll
+            for (int e = 0; e < 2; e++) {
+                const int j = j0 + e;
                 const float dec = (j <= i) ? __expf(cum[i] - cum[j]) : 0.f;
-                ut[i * CHUNK + j] = (j < i) ? beta[i] * kk * dec : 0.f;
-                at[i * CHUNK + j] = (j <= i) ? qk * qscale * dec : 0.f;
+                ut[i * CHUNK + j] = (j < i) ? beta[i] * kk[nt][half * 2 + e] * dec : 0.f;
+                a2[e] = (j <= i) ? qk[nt][half * 2 + e] * qscale * dec : 0.f;
             }
+            *reinterpret_cast<uint32_t*>(at_out + i * CHUNK + j0) = pack_bf16(a2[0], a2[1]);
         }
     }
     __syncthreads();
 
-    // Forward substitution with the unit lower triangular (I + ut): threads 0..127 solve new_values (v beta),
-    // threads 128..255 solve k_cumdecay (k beta exp(cum)); each thread owns one column.
+    // Forward substitution with the unit lower triangular (I + A), fully unrolled so x stays in registers:
+    // threads 0..127 solve u (column of v beta), threads 128..255 solve w (column of k beta exp(cum)).
     {
         const int col = threadIdx.x & 127;
         const bool kc = threadIdx.x >= 128;
         float x[CHUNK];
+#pragma unroll
         for (int i = 0; i < CHUNK; i++) {
             float rhs = 0.f;
             if ((uint32_t)i < remaining) {
-                if (kc) rhs = ks[i * DK + col] * beta[i] * __expf(cum[i]);
+                if (kc) rhs = bf2f(ks[i * QS + col]) * beta[i] * __expf(cum[i]);
                 else rhs = bf2f(qkv[(size_t)(tok0 + i) * QKV_STRIDE + 4096 + h * DV + col]) * beta[i];
             }
-            float acc = rhs;
+            x[i] = rhs;
+        }
+#pragma unroll
+        for (int i = 1; i < CHUNK; i++) {
+            float acc = x[i];
+#pragma unroll
             for (int j = 0; j < i; j++) acc -= ut[i * CHUNK + j] * x[j];
             x[i] = acc;
         }
-        float* dst = kc ? k_cumdecay : new_values;
+        bf16* dst = kc ? w_out : u_out;
+#pragma unroll
         for (int i = 0; i < CHUNK; i++)
-            if ((uint32_t)i < remaining) dst[((size_t)(tok0 + i) * V_HEADS + h) * DV + col] = x[i];
+            if ((uint32_t)i < remaining) dst[((size_t)(tok0 + i) * V_HEADS + h) * DV + col] = f2bf(x[i]);
     }
-    // The intra-chunk attention matrix: [chunk][48][64][64].
-    for (int i = threadIdx.x; i < CHUNK * CHUNK; i += blockDim.x)
-        intra[((size_t)blockIdx.x * V_HEADS + h) * CHUNK * CHUNK + i] = at[i];
 }
 
-// Block: 128 threads; column vd = half * 64 + t / 2; k-dims (t & 1) * 64 .. + 64 of S held in registers.
-#define DELTA_STATE_SMEM ((CHUNK * DK + CHUNK * CHUNK + CHUNK) * 4)
+// ---------------------------------------------------------------------------------------------------------
+// delta_state: block (sequence, head) of 128 threads = 4 warps; warp w holds rows 32w..32w+31 of S^T
+// (S^T[n][d]: n = value dim, d = key dim) as 2 x 16 mma accumulators.
+// Shared: w [64][QS] bf16, v_new^T [128][TS] bf16, k~^T [128][TS] bf16, cum [64] f32.
+#define DELTA_STATE_SMEM (CHUNK * QS * 2 + 2 * DV * TS * 2 + CHUNK * 4)
 
 extern "C" __global__ void delta_state(const DeltaSeq* __restrict__ seqs, const DeltaChunk* __restrict__ chunks,
-                                       const bf16* __restrict__ qkv, const float* __restrict__ new_values,
-                                       const float* __restrict__ k_cumdecay, const float* __restrict__ intra,
-                                       const float* __restrict__ cum_decay, bf16* __restrict__ out) {
-    extern __shared__ float smem[];
-    float* buf = smem;                 // [64][128]: kc, then q, then k of the chunk
-    float* at = buf + CHUNK * DK;      // [64][64]
-    float* cum = at + CHUNK * CHUNK;   // [64]
+                                       const bf16* __restrict__ qkv, const bf16* __restrict__ u_in,
+                                       const bf16* __restrict__ w_in, const float* __restrict__ cum_decay,
+                                       bf16* __restrict__ states, bf16* __restrict__ vnew_out) {
+    extern __shared__ __align__(16) unsigned char dsmem[];
+    bf16* ws = reinterpret_cast<bf16*>(dsmem);  // [64][QS]
+    bf16* vT = ws + CHUNK * QS;                  // [128][TS]: v_new^T
+    bf16* kT = vT + DV * TS;                     // [128][TS]: (k exp(cum_last - cum))^T
+    float* cum = reinterpret_cast<float*>(kT + DK * TS);
     const DeltaSeq s = seqs[blockIdx.x];
-    const uint32_t h = blockIdx.y, kh = h / 3, half = blockIdx.z;
-    const int t = threadIdx.x, col = half * 64 + (t >> 1), k0 = (t & 1) * 64;
-    float S[64];
+    const uint32_t h = blockIdx.y, kh = h / 3;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+
+    float hT[2][DK / 8][4];
 #pragma unroll
-    for (int i = 0; i < 64; i++) S[i] = 0.f;
+    for (int m = 0; m < 2; m++)
+#pragma unroll
+        for (int nt = 0; nt < DK / 8; nt++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) hT[m][nt][e] = 0.f;
 
     for (uint32_t ci = 0; ci < s.chunks; ci++) {
-        const DeltaChunk c = chunks[s.first_chunk + ci];
+        const uint32_t chunk = s.first_chunk + ci;
+        const DeltaChunk c = chunks[chunk];
         const uint32_t tok0 = c.seq_start + c.chunk_start, remaining = c.seq_len - c.chunk_start;
-        const uint32_t len = min(remaining, (uint32_t)CHUNK);
-        // cum decays and the intra matrix.
-        __syncthreads();
-        for (int i = t; i < CHUNK; i += 128) cum[i] = (uint32_t)i < len ? cum_decay[(size_t)(tok0 + i) * V_HEADS + h] : 0.f;
-        for (int i = t; i < CHUNK * CHUNK; i += 128) at[i] = intra[((size_t)(s.first_chunk + ci) * V_HEADS + h) * CHUNK * CHUNK + i];
-        // kc rows of the chunk.
-        for (int i = t; i < CHUNK * DK; i += 128) {
-            const int row = i / DK, d = i % DK;
-            buf[i] = (uint32_t)row < len ? k_cumdecay[((size_t)(tok0 + row) * V_HEADS + h) * DV + d] : 0.f;
-        }
-        __syncthreads();
-        // v_new[j][col] = new_values[j][col] - sum_d kc[j][d] S[d][col]
-        float vnew[CHUNK];
-        for (int j = 0; j < CHUNK; j++) {
-            float acc = 0.f;
-#pragma unroll 16
-            for (int d = 0; d < 64; d++) acc += buf[j * DK + k0 + d] * S[d];
-            acc += __shfl_xor_sync(0xffffffffu, acc, 1);
-            const float nv = (uint32_t)j < len ? new_values[((size_t)(tok0 + j) * V_HEADS + h) * DV + col] : 0.f;
-            vnew[j] = nv - acc;
-        }
-        // q (l2-normalized, scaled, decayed by exp(cum_j)) rows into buf.
-        __syncthreads();
-        for (int row = t >> 5; row < CHUNK; row += 4) {
-            float v4[4] = {0.f, 0.f, 0.f, 0.f};
-            if ((uint32_t)row < len) load_l2norm_lane(qkv, tok0 + row, 0, kh, v4);
-            const float f = rsqrtf((float)DK) * __expf(cum[row]);
-            const int lane = t & 31;
+        const int len = (int)min(remaining, (uint32_t)CHUNK);
+        __syncthreads(); // the previous chunk is done with the shared buffers
+        if (threadIdx.x < CHUNK) cum[threadIdx.x] = threadIdx.x < len ? cum_decay[(size_t)(tok0 + threadIdx.x) * V_HEADS + h] : 0.f;
+        // The state entering this chunk, for delta_out.
+        bf16* st = states + ((size_t)chunk * V_HEADS + h) * DV * DK;
 #pragma unroll
-            for (int i = 0; i < 4; i++) buf[row * DK + lane * 4 + i] = v4[i] * f;
-        }
-        __syncthreads();
-        // out[j][col] = sum_d q[j][d] S[d][col] + sum_i attn[j][i] vnew[i][col]
-        for (int j = 0; j < CHUNK; j++) {
-            float acc = 0.f;
-#pragma unroll 16
-            for (int d = 0; d < 64; d++) acc += buf[j * DK + k0 + d] * S[d];
-            acc += __shfl_xor_sync(0xffffffffu, acc, 1);
-            float ia = 0.f;
-            for (int i = 0; i <= j; i++) ia += at[j * CHUNK + i] * vnew[i];
-            if ((uint32_t)j < len && (t & 1) == 0)
-                out[((size_t)(tok0 + j) * V_HEADS + h) * DV + col] = f2bf(acc + ia);
-        }
-        // k (l2-normalized, decayed by exp(cum_last - cum_j)) rows into buf; then S = S * exp(cum_last) + k^T vnew.
-        __syncthreads();
-        const float cum_last = cum[len > 0 ? len - 1 : 0];
-        for (int row = t >> 5; row < CHUNK; row += 4) {
-            float v4[4] = {0.f, 0.f, 0.f, 0.f};
-            if ((uint32_t)row < len) load_l2norm_lane(qkv, tok0 + row, 2048, kh, v4);
+        for (int m = 0; m < 2; m++)
+#pragma unroll
+            for (int nt = 0; nt < DK / 8; nt++) {
+                const int n = 32 * warp + m * 16 + g, d = nt * 8 + 2 * t;
+                *reinterpret_cast<uint32_t*>(st + n * DK + d) = pack_bf16(hT[m][nt][0], hT[m][nt][1]);
+                *reinterpret_cast<uint32_t*>(st + (n + 8) * DK + d) = pack_bf16(hT[m][nt][2], hT[m][nt][3]);
+            }
+        stage_rows(ws, QS, w_in + ((size_t)tok0 * V_HEADS + h) * DV, (size_t)V_HEADS * DV, CHUNK, DV, len);
+        __syncthreads(); // cum
+        const float cum_last = cum[len - 1];
+        for (int row = warp; row < CHUNK; row += 4) {
+            float k4[4] = {0.f, 0.f, 0.f, 0.f};
+            if (row < len) load_l2norm_lane(qkv, tok0 + row, 2048, kh, k4);
             const float f = __expf(cum_last - cum[row]);
-            const int lane = t & 31;
 #pragma unroll
-            for (int i = 0; i < 4; i++) buf[row * DK + lane * 4 + i] = v4[i] * f;
+            for (int i = 0; i < 4; i++) kT[(lane * 4 + i) * TS + row] = f2bf(k4[i] * f);
         }
-        __syncthreads();
-        const float chunk_decay = __expf(cum_last);
-#pragma unroll 8
-        for (int d = 0; d < 64; d++) {
-            float acc = 0.f;
-            for (int j = 0; j < CHUNK; j++) acc += buf[j * DK + k0 + d] * vnew[j];
-            S[d] = S[d] * chunk_decay + acc;
+        __syncthreads(); // ws, kT
+
+        // v_new = u - w S for this warp's 32 columns, one 8-column tile at a time (registers: S^T is 128 of them);
+        // S as B fragments straight from hT.
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            float cf[4][4];
+#pragma unroll
+            for (int m = 0; m < 4; m++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) cf[m][e] = 0.f;
+#pragma unroll
+            for (int kstep = 0; kstep < DK / 16; kstep++) {
+                uint32_t b[2];
+                b[0] = pack_bf16(hT[nt >> 1][2 * kstep][(nt & 1) * 2], hT[nt >> 1][2 * kstep][(nt & 1) * 2 + 1]);
+                b[1] = pack_bf16(hT[nt >> 1][2 * kstep + 1][(nt & 1) * 2], hT[nt >> 1][2 * kstep + 1][(nt & 1) * 2 + 1]);
+#pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    uint32_t a[4];
+                    load_a_frag(a, ws, QS, m * 16, kstep * 16, g, t);
+                    mma_bf16(cf[m], a, b);
+                }
+            }
+            const int n0 = 32 * warp + nt * 8 + 2 * t;
+#pragma unroll
+            for (int m = 0; m < 4; m++)
+#pragma unroll
+                for (int rr = 0; rr < 2; rr++) {
+                    const int j = m * 16 + g + rr * 8;
+                    float u0 = 0.f, u1 = 0.f;
+                    if (j < len) {
+                        const uint32_t raw = *reinterpret_cast<const uint32_t*>(u_in + ((size_t)(tok0 + j) * V_HEADS + h) * DV + n0);
+                        const bf16* up = reinterpret_cast<const bf16*>(&raw);
+                        u0 = bf2f(up[0]);
+                        u1 = bf2f(up[1]);
+                    }
+                    vT[n0 * TS + j] = f2bf(u0 - cf[m][rr * 2]);
+                    vT[(n0 + 1) * TS + j] = f2bf(u1 - cf[m][rr * 2 + 1]);
+                }
         }
+        __syncthreads(); // vT
+        // v_new^T out for delta_out: [chunk][head][128][64].
+        bf16* vo = vnew_out + ((size_t)chunk * V_HEADS + h) * DV * CHUNK;
+        for (int i = threadIdx.x; i < DV * (CHUNK / 8); i += blockDim.x) {
+            const int n = i >> 3, c8 = (i & 7) * 8;
+            *reinterpret_cast<uint4*>(vo + n * CHUNK + c8) = *reinterpret_cast<const uint4*>(vT + n * TS + c8);
+        }
+        // S^T = exp(cum_last) S^T + v_new^T k~.
+        const float decay = __expf(cum_last);
+#pragma unroll
+        for (int m = 0; m < 2; m++)
+#pragma unroll
+            for (int nt = 0; nt < DK / 8; nt++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) hT[m][nt][e] *= decay;
+#pragma unroll
+        for (int kstep = 0; kstep < CHUNK / 16; kstep++) {
+            uint32_t a[2][4];
+#pragma unroll
+            for (int m = 0; m < 2; m++) load_a_frag(a[m], vT, TS, 32 * warp + m * 16, kstep * 16, g, t);
+#pragma unroll
+            for (int nt = 0; nt < DK / 8; nt++) {
+                uint32_t b[2];
+                load_b_frag(b, kT, TS, nt * 8, kstep * 16, g, t);
+#pragma unroll
+                for (int m = 0; m < 2; m++) mma_bf16(hT[m][nt], a[m], b);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// delta_out: block (chunk, head) of 128 threads = 4 warps; warp w produces rows 16w..16w+15 of the chunk.
+// Shared: S^T [128][QS] bf16, v_new^T [128][TS] bf16, q~ [64][QS] bf16, at [64][TS] bf16, cum [64] f32.
+#define DELTA_OUT_SMEM (DV * QS * 2 + DV * TS * 2 + CHUNK * QS * 2 + CHUNK * TS * 2 + CHUNK * 4)
+
+extern "C" __global__ void delta_out(const DeltaChunk* __restrict__ chunks, const bf16* __restrict__ qkv,
+                                     const float* __restrict__ cum_decay, const bf16* __restrict__ intra,
+                                     const bf16* __restrict__ states, const bf16* __restrict__ vnew_in,
+                                     bf16* __restrict__ out) {
+    extern __shared__ __align__(16) unsigned char dsmem[];
+    bf16* hs = reinterpret_cast<bf16*>(dsmem); // [128][QS]: S^T
+    bf16* vT = hs + DV * QS;                    // [128][TS]
+    bf16* qs = vT + DV * TS;                    // [64][QS]
+    bf16* at = qs + CHUNK * QS;                 // [64][TS]
+    float* cum = reinterpret_cast<float*>(at + CHUNK * TS);
+    const uint32_t chunk = blockIdx.x;
+    const DeltaChunk c = chunks[chunk];
+    const uint32_t h = blockIdx.y, kh = h / 3;
+    const uint32_t tok0 = c.seq_start + c.chunk_start, remaining = c.seq_len - c.chunk_start;
+    const int len = (int)min(remaining, (uint32_t)CHUNK);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+
+    if (threadIdx.x < CHUNK) cum[threadIdx.x] = threadIdx.x < len ? cum_decay[(size_t)(tok0 + threadIdx.x) * V_HEADS + h] : 0.f;
+    stage_rows(hs, QS, states + ((size_t)chunk * V_HEADS + h) * DV * DK, DK, DV, DK, DV);
+    stage_rows(vT, TS, vnew_in + ((size_t)chunk * V_HEADS + h) * DV * CHUNK, CHUNK, DV, CHUNK, DV);
+    stage_rows(at, TS, intra + ((size_t)chunk * V_HEADS + h) * CHUNK * CHUNK, CHUNK, CHUNK, CHUNK, CHUNK);
+    __syncthreads(); // cum
+    const float qscale = rsqrtf((float)DK);
+    for (int row = warp; row < CHUNK; row += 4) {
+        float q4[4] = {0.f, 0.f, 0.f, 0.f};
+        if (row < len) load_l2norm_lane(qkv, tok0 + row, 0, kh, q4);
+        store_lane4(qs + row * QS, q4, qscale * __expf(cum[row]));
+    }
+    __syncthreads();
+
+    float o[DV / 8][4];
+#pragma unroll
+    for (int nt = 0; nt < DV / 8; nt++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) o[nt][e] = 0.f;
+    // o = q~ S: A from q~, B from S^T[n][d].
+#pragma unroll
+    for (int kstep = 0; kstep < DK / 16; kstep++) {
+        uint32_t a[4];
+        load_a_frag(a, qs, QS, warp * 16, kstep * 16, g, t);
+#pragma unroll
+        for (int nt = 0; nt < DV / 8; nt++) {
+            uint32_t b[2];
+            load_b_frag(b, hs, QS, nt * 8, kstep * 16, g, t);
+            mma_bf16(o[nt], a, b);
+        }
+    }
+    // o += at v_new: A from at [j][i], B from v_new^T [n][i].
+#pragma unroll
+    for (int kstep = 0; kstep < CHUNK / 16; kstep++) {
+        uint32_t a[4];
+        load_a_frag(a, at, TS, warp * 16, kstep * 16, g, t);
+#pragma unroll
+        for (int nt = 0; nt < DV / 8; nt++) {
+            uint32_t b[2];
+            load_b_frag(b, vT, TS, nt * 8, kstep * 16, g, t);
+            mma_bf16(o[nt], a, b);
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < 2; rr++) {
+        const int j = warp * 16 + g + rr * 8;
+        if (j >= len) continue;
+        bf16* orow = out + ((size_t)(tok0 + j) * V_HEADS + h) * DV;
+#pragma unroll
+        for (int nt = 0; nt < DV / 8; nt++)
+            *reinterpret_cast<uint32_t*>(orow + nt * 8 + 2 * t) = pack_bf16(o[nt][rr * 2], o[nt][rr * 2 + 1]);
     }
 }
 

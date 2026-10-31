@@ -98,9 +98,9 @@ Phase 2: the kernels, the forward pass (text and vision) and the Docker image: d
 (2026-10-31). `scripts/compare_servers.py` against the Python server on the same checkpoint: 16 decisions over
 three text states and one image request, no top answer changed, probabilities within 0.048 (0.012 on average);
 app.py accepts its own optimizations below 0.2. Startup is 43 s from a warm volume. Short requests run at about the
-Python server's speed and a 4,300-character one at half of it; the simplifications to revisit are the delta rule on
-CUDA cores (fp32), not tensor cores; the last layer computing every token rather than only the marker rows; and no
-CUDA graphs. Note: on consumer Blackwell cuBLASLt has no rowwise FP8 scaling, so the FP8 projections run with
+Python server's speed and a 4,300-character one at half of it; profiled (`DECISION_PROFILE=1`), 73% of a 3,400-token pass was the delta rule
+on CUDA cores; it now runs on the tensor cores in fla's three-kernel structure (not yet measured). Still to do: the
+last layer computing every token rather than only the marker rows; no CUDA graphs. Note: on consumer Blackwell cuBLASLt has no rowwise FP8 scaling, so the FP8 projections run with
 scalar scales and a rescale kernel (`scale_rows_cols`).
 
 Phase 3: tuning (the delta rule and attention on long requests), CUDA graphs for short requests, the memory

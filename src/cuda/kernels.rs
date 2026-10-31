@@ -15,10 +15,11 @@ const FATBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.fatbin")
 /// Threads per block for the row kernels (one block per row).
 const ROW_THREADS: u32 = 256;
 
-/// The delta-rule chunk kernels' dynamic shared memory (deltanet.cu's DELTA_CHUNK_SMEM / DELTA_STATE_SMEM).
+/// The delta-rule kernels' dynamic shared memory (deltanet.cu's DELTA_*_SMEM; QS = 136, TS = 72).
 pub const DELTA_CHUNK: usize = 64;
-const DELTA_CHUNK_SMEM: u32 = ((64 * 128 + 2 * 64 * 64) * 4) as u32;
-const DELTA_STATE_SMEM: u32 = ((64 * 128 + 64 * 64 + 64) * 4) as u32;
+const DELTA_CHUNK_SMEM: u32 = (2 * 64 * 136 * 2 + 64 * 64 * 4) as u32;
+const DELTA_STATE_SMEM: u32 = (64 * 136 * 2 + 2 * 128 * 72 * 2 + 64 * 4) as u32;
+const DELTA_OUT_SMEM: u32 = (128 * 136 * 2 + 128 * 72 * 2 + 64 * 136 * 2 + 64 * 72 * 2 + 64 * 4) as u32;
 
 /// Queries per attention block (attention.cu's QUERIES).
 pub const ATTENTION_QUERIES: usize = 64;
@@ -41,6 +42,7 @@ pub struct Kernels {
     conv1d_silu: CudaFunction,
     delta_chunk: CudaFunction,
     delta_state: CudaFunction,
+    delta_out: CudaFunction,
     gated_norm: CudaFunction,
     gather_rows: CudaFunction,
     scatter_rows: CudaFunction,
@@ -77,8 +79,10 @@ impl Kernels {
         let f = |name: &str| module.load_function(name);
         let delta_chunk = f("delta_chunk")?;
         let delta_state = f("delta_state")?;
+        let delta_out = f("delta_out")?;
         delta_chunk.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DELTA_CHUNK_SMEM as i32)?;
         delta_state.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DELTA_STATE_SMEM as i32)?;
+        delta_out.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DELTA_OUT_SMEM as i32)?;
         Ok(Self {
             quantize_fp4: f("quantize_fp4")?,
             fp4_zero_scale_padding: f("fp4_zero_scale_padding")?,
@@ -95,6 +99,7 @@ impl Kernels {
             conv1d_silu: f("conv1d_silu")?,
             delta_chunk,
             delta_state,
+            delta_out,
             gated_norm: f("gated_norm")?,
             gather_rows: f("gather_rows")?,
             scatter_rows: f("scatter_rows")?,
@@ -278,22 +283,34 @@ impl Kernels {
         Ok(())
     }
 
-    /// The within-chunk half of the delta rule: one block per (chunk, value head).
+    /// The within-chunk part of the delta rule: one block per (chunk, value head). Writes u, w [N, 48, 128] bf16,
+    /// the intra-chunk attention [chunks, 48, 64, 64] bf16 and the cumulative decays [N, 48] f32.
     #[allow(clippy::too_many_arguments)]
-    pub fn delta_chunk(&self, chunks: &CudaSlice<u32>, n_chunks: usize, qkv: &CudaSlice<u16>, ab: &CudaSlice<u16>, a_log_exp: &CudaSlice<f32>, dt_bias: &CudaSlice<f32>, new_values: &mut CudaSlice<f32>, k_cumdecay: &mut CudaSlice<f32>, intra: &mut CudaSlice<f32>, cum_decay: &mut CudaSlice<f32>) -> Result<(), CudaError> {
+    pub fn delta_chunk(&self, chunks: &CudaSlice<u32>, n_chunks: usize, qkv: &CudaSlice<u16>, ab: &CudaSlice<u16>, a_log_exp: &CudaSlice<f32>, dt_bias: &CudaSlice<f32>, u: &mut CudaSlice<u16>, w: &mut CudaSlice<u16>, intra: &mut CudaSlice<u16>, cum_decay: &mut CudaSlice<f32>) -> Result<(), CudaError> {
         let cfg = LaunchConfig { grid_dim: (n_chunks as u32, 48, 1), block_dim: (256, 1, 1), shared_mem_bytes: DELTA_CHUNK_SMEM };
         unsafe {
-            self.stream.launch_builder(&self.delta_chunk).arg(chunks).arg(qkv).arg(ab).arg(a_log_exp).arg(dt_bias).arg(new_values).arg(k_cumdecay).arg(intra).arg(cum_decay).launch(cfg)?;
+            self.stream.launch_builder(&self.delta_chunk).arg(chunks).arg(qkv).arg(ab).arg(a_log_exp).arg(dt_bias).arg(u).arg(w).arg(intra).arg(cum_decay).launch(cfg)?;
         }
         Ok(())
     }
 
-    /// The sequential half: one block per (sequence, value head, half of the state columns); out [N, 48, 128] bf16.
+    /// The sequential part: one block per (sequence, value head) walks its chunks, storing each chunk's incoming
+    /// state [chunks, 48, 128, 128] bf16 and v_new^T [chunks, 48, 128, 64] bf16.
     #[allow(clippy::too_many_arguments)]
-    pub fn delta_state(&self, seqs: &CudaSlice<u32>, n_seqs: usize, chunks: &CudaSlice<u32>, qkv: &CudaSlice<u16>, new_values: &CudaSlice<f32>, k_cumdecay: &CudaSlice<f32>, intra: &CudaSlice<f32>, cum_decay: &CudaSlice<f32>, out: &mut CudaSlice<u16>) -> Result<(), CudaError> {
-        let cfg = LaunchConfig { grid_dim: (n_seqs as u32, 48, 2), block_dim: (128, 1, 1), shared_mem_bytes: DELTA_STATE_SMEM };
+    pub fn delta_state(&self, seqs: &CudaSlice<u32>, n_seqs: usize, chunks: &CudaSlice<u32>, qkv: &CudaSlice<u16>, u: &CudaSlice<u16>, w: &CudaSlice<u16>, cum_decay: &CudaSlice<f32>, states: &mut CudaSlice<u16>, vnew: &mut CudaSlice<u16>) -> Result<(), CudaError> {
+        let cfg = LaunchConfig { grid_dim: (n_seqs as u32, 48, 1), block_dim: (128, 1, 1), shared_mem_bytes: DELTA_STATE_SMEM };
         unsafe {
-            self.stream.launch_builder(&self.delta_state).arg(seqs).arg(chunks).arg(qkv).arg(new_values).arg(k_cumdecay).arg(intra).arg(cum_decay).arg(out).launch(cfg)?;
+            self.stream.launch_builder(&self.delta_state).arg(seqs).arg(chunks).arg(qkv).arg(u).arg(w).arg(cum_decay).arg(states).arg(vnew).launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// The outputs: one block per (chunk, value head); out [N, 48, 128] bf16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_out(&self, chunks: &CudaSlice<u32>, n_chunks: usize, qkv: &CudaSlice<u16>, cum_decay: &CudaSlice<f32>, intra: &CudaSlice<u16>, states: &CudaSlice<u16>, vnew: &CudaSlice<u16>, out: &mut CudaSlice<u16>) -> Result<(), CudaError> {
+        let cfg = LaunchConfig { grid_dim: (n_chunks as u32, 48, 1), block_dim: (128, 1, 1), shared_mem_bytes: DELTA_OUT_SMEM };
+        unsafe {
+            self.stream.launch_builder(&self.delta_out).arg(chunks).arg(qkv).arg(cum_decay).arg(intra).arg(states).arg(vnew).arg(out).launch(cfg)?;
         }
         Ok(())
     }

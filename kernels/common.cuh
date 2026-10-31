@@ -76,3 +76,35 @@ __device__ __forceinline__ uint32_t swizzled_scale_index(uint32_t row, uint32_t 
     const uint32_t in_row = row & 127, hi = in_row >> 5, lo = in_row & 31;
     return tile * 512u + lo * 16u + hi * 4u + (col & 3);
 }
+
+// --- Tensor cores: mma.sync.m16n8k16 (row.col, bf16 -> f32). With g = lane / 4 and t = lane % 4:
+//   A (16x16, row-major): a0 = A[g][2t..2t+1], a1 = A[g+8][2t..], a2 = A[g][2t+8..], a3 = A[g+8][2t+8..]
+//   B (16x8, "col"):      b0 = B[2t..2t+1][g], b1 = B[2t+8..2t+9][g]
+//   C (16x8, f32):        c0,c1 = C[g][2t, 2t+1], c2,c3 = C[g+8][2t, 2t+1]
+__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
+    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+
+__device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// A fragment of the 16x16 tile at (m0, k0) of a row-major [m][k] bf16 matrix with row stride `stride`.
+__device__ __forceinline__ void load_a_frag(uint32_t* a, const bf16* A, int stride, int m0, int k0, int g, int t) {
+    const bf16* p = A + (m0 + g) * stride + k0 + 2 * t;
+    a[0] = *reinterpret_cast<const uint32_t*>(p);
+    a[1] = *reinterpret_cast<const uint32_t*>(p + 8 * stride);
+    a[2] = *reinterpret_cast<const uint32_t*>(p + 8);
+    a[3] = *reinterpret_cast<const uint32_t*>(p + 8 * stride + 8);
+}
+
+// B fragment of the 16x8 tile at (k0, n0) of B, stored transposed: a row-major [n][k] bf16 matrix.
+__device__ __forceinline__ void load_b_frag(uint32_t* b, const bf16* Bt, int stride, int n0, int k0, int g, int t) {
+    const bf16* p = Bt + (n0 + g) * stride + k0 + 2 * t;
+    b[0] = *reinterpret_cast<const uint32_t*>(p);
+    b[1] = *reinterpret_cast<const uint32_t*>(p + 8);
+}

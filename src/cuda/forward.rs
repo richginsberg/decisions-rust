@@ -201,10 +201,12 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
                 timer.tick("bf16mm");
                 kernels.conv1d_silu(&ws.wide, &lin.conv, &seq_of, &mut ws.mid, n, qkv_dim)?;
                 timer.tick("conv");
-                kernels.delta_chunk(&delta_chunks, n_chunks, &ws.mid, &ws.ab, &lin.a_log_exp, &lin.dt_bias, &mut ws.new_values, &mut ws.k_cumdecay, &mut ws.intra, &mut ws.cum_decay)?;
+                kernels.delta_chunk(&delta_chunks, n_chunks, &ws.mid, &ws.ab, &lin.a_log_exp, &lin.dt_bias, &mut ws.delta_u, &mut ws.delta_w, &mut ws.delta_intra, &mut ws.cum_decay)?;
                 timer.tick("delta.chunk");
-                kernels.delta_state(&delta_seqs, pack.seqs.len(), &delta_chunks, &ws.mid, &ws.new_values, &ws.k_cumdecay, &ws.intra, &ws.cum_decay, &mut ws.mixed)?;
-                timer.tick("delta.chunk");
+                kernels.delta_state(&delta_seqs, pack.seqs.len(), &delta_chunks, &ws.mid, &ws.delta_u, &ws.delta_w, &ws.cum_decay, &mut ws.delta_states, &mut ws.delta_vnew)?;
+                timer.tick("delta.state");
+                kernels.delta_out(&delta_chunks, n_chunks, &ws.mid, &ws.cum_decay, &ws.delta_intra, &ws.delta_states, &ws.delta_vnew, &mut ws.mixed)?;
+                timer.tick("delta.out");
                 // mixed holds the delta-rule output [N, 48, 128]; the gated norm writes out_proj's input (into
                 // `wide`, whose qkv the conv has consumed).
                 kernels.gated_norm(&ws.mixed, &ws.z, &lin.norm, &mut ws.wide, n, eps)?;

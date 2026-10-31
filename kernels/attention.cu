@@ -21,18 +21,6 @@
 #define QUERIES 64
 #define THREADS 128
 
-__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
-    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
-    return *reinterpret_cast<uint32_t*>(&v);
-}
-
-__device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, const uint32_t* b) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
 // A sequence's slice of the pack and which 64-query tile this block handles.
 struct AttnTile {
     uint32_t seq_start; // first token of the sequence in the pack
