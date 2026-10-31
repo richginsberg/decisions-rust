@@ -92,12 +92,14 @@ The Pod's settings carry over: `AUTOJEV_API_KEY` (required),
 
 Phase 1 (no GPU): protocol, API, batcher, weights loader, image preprocessing: done and tested.
 
-Phase 2: the kernels, the forward pass (text and vision) and the Docker image are written and compile for
-sm_100 and sm_120, but **have not run on a GPU yet**: the development machine has none. The first run on a
-Blackwell Pod should start with `scripts/compare_servers.py` against the Python server; app.py accepts its own
-optimizations below a 0.2 shift with no top answer changed and typically sees under 0.1. Known simplifications
-to revisit after that: the delta rule runs on CUDA cores (fp32), not tensor cores; the last layer computes every
-token rather than only the marker rows; no CUDA graphs.
+Phase 2: the kernels, the forward pass (text and vision) and the Docker image: done and verified on an RTX 5090
+(2026-10-31). `scripts/compare_servers.py` against the Python server on the same checkpoint: 16 decisions over
+three text states and one image request, no top answer changed, probabilities within 0.048 (0.012 on average);
+app.py accepts its own optimizations below 0.2. Startup is 43 s from a warm volume. Short requests run at about the
+Python server's speed and a 4,300-character one at half of it; the simplifications to revisit are the delta rule on
+CUDA cores (fp32), not tensor cores; the last layer computing every token rather than only the marker rows; and no
+CUDA graphs. Note: on consumer Blackwell cuBLASLt has no rowwise FP8 scaling, so the FP8 projections run with
+scalar scales and a rescale kernel (`scale_rows_cols`).
 
 Phase 3: tuning (the delta rule and attention on long requests), CUDA graphs for short requests, the memory
 budget on 32 GB GPUs.
