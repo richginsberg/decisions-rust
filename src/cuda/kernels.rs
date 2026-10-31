@@ -34,6 +34,7 @@ pub struct Kernels {
     quantize_fp8: CudaFunction,
     silu_mul_fp4: CudaFunction,
     add_inplace: CudaFunction,
+    scale_rows_cols: CudaFunction,
     attention: CudaFunction,
     vision_attention: CudaFunction,
     head_norm_rotary: CudaFunction,
@@ -87,6 +88,7 @@ impl Kernels {
             quantize_fp8: f("quantize_fp8")?,
             silu_mul_fp4: f("silu_mul_fp4")?,
             add_inplace: f("add_inplace")?,
+            scale_rows_cols: f("scale_rows_cols")?,
             attention: f("attention")?,
             vision_attention: f("vision_attention")?,
             head_norm_rotary: f("head_norm_rotary")?,
@@ -198,6 +200,16 @@ impl Kernels {
             self.stream.launch_builder(&self.silu_mul_fp4).arg(gate_up).arg(&mut *packed).arg(&mut *scales).arg(&n32).arg(&encode).launch(Self::rows(rows))?;
         }
         self.zero_scale_padding(scales, rows, n)
+    }
+
+    /// out[rows, n] bf16 = acc[rows, n] f32 * row_scale[row] * col_scale[col] (n a multiple of 8).
+    pub fn scale_rows_cols(&self, acc: &CudaSlice<f32>, row_scale: &CudaSlice<f32>, col_scale: &CudaSlice<f32>, out: &mut CudaSlice<u16>, rows: usize, n: usize) -> Result<(), CudaError> {
+        let total = rows * n;
+        let (n32, total32) = (n as u32, total as u32);
+        unsafe {
+            self.stream.launch_builder(&self.scale_rows_cols).arg(acc).arg(row_scale).arg(col_scale).arg(out).arg(&n32).arg(&total32).launch(Self::elements(total, 8))?;
+        }
+        Ok(())
     }
 
     /// y += x over `total` bf16 values (a multiple of 8).

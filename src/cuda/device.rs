@@ -108,6 +108,8 @@ pub struct Workspace {
     pub fp4_scales: CudaSlice<u8>,
     pub fp8_values: CudaSlice<u8>,
     pub fp8_scales: CudaSlice<f32>,
+    /// [N, 10240] f32: the FP8 matmuls' unscaled accumulator (cuBLASLt scales FP8 rowwise on Hopper only).
+    pub fp8_acc: CudaSlice<f32>,
     /// [N, 2 * intermediate]: the merged gate/up output; also the q_proj and linear qkv outputs.
     pub wide: CudaSlice<u16>,
     /// [N, 10240]: the conv output; also the k_proj / v_proj outputs and the attention output.
@@ -484,6 +486,7 @@ impl Workspace {
             fp4_scales: stream.alloc_zeros(swizzled_scale_bytes(n, text.intermediate_size))?,
             fp8_values: stream.alloc_zeros(n * v_dim.max(hidden))?,
             fp8_scales: stream.alloc_zeros(n)?,
+            fp8_acc: stream.alloc_zeros(n * qkv_dim)?,
             wide: stream.alloc_zeros(n * wide)?,
             mid: stream.alloc_zeros(n * qkv_dim)?,
             z: stream.alloc_zeros(n * v_dim)?,

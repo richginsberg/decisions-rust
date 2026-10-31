@@ -181,8 +181,10 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
                 let v_dim = lin.z.n;
                 kernels.rms_norm(&ws.h, None, &layer.input_norm, &mut ws.normed, n, hidden, eps)?;
                 kernels.quantize_fp8(&ws.normed, &mut ws.fp8_values, &mut ws.fp8_scales, n, hidden)?;
-                lt.fp8(&ws.fp8_values, &ws.fp8_scales, &lin.qkv, &mut ws.wide, n)?;
-                lt.fp8(&ws.fp8_values, &ws.fp8_scales, &lin.z, &mut ws.z, n)?;
+                lt.fp8(&ws.fp8_values, &lin.qkv, &mut ws.fp8_acc, n)?;
+                kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.qkv.scale, &mut ws.wide, n, qkv_dim)?;
+                lt.fp8(&ws.fp8_values, &lin.z, &mut ws.fp8_acc, n)?;
+                kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.z.scale, &mut ws.z, n, v_dim)?;
                 lt.bf16(&ws.normed, &lin.ab, &mut ws.ab, n)?;
                 kernels.conv1d_silu(&ws.wide, &lin.conv, &seq_of, &mut ws.mid, n, qkv_dim)?;
                 kernels.delta_chunk(&delta_chunks, n_chunks, &ws.mid, &ws.ab, &lin.a_log_exp, &lin.dt_bias, &mut ws.new_values, &mut ws.k_cumdecay, &mut ws.intra, &mut ws.cum_decay)?;
@@ -191,7 +193,8 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
                 // `wide`, whose qkv the conv has consumed).
                 kernels.gated_norm(&ws.mixed, &ws.z, &lin.norm, &mut ws.wide, n, eps)?;
                 kernels.quantize_fp8(&ws.wide, &mut ws.fp8_values, &mut ws.fp8_scales, n, v_dim)?;
-                lt.fp8(&ws.fp8_values, &ws.fp8_scales, &lin.out, &mut ws.out, n)?;
+                lt.fp8(&ws.fp8_values, &lin.out, &mut ws.fp8_acc, n)?;
+                kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.out.scale, &mut ws.out, n, hidden)?;
             }
             Mixer::Full(full) => {
                 let heads = text.num_attention_heads;

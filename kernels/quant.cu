@@ -217,6 +217,24 @@ extern "C" __global__ void silu_mul_fp4(const bf16* __restrict__ gate_up, uint8_
     }
 }
 
+// The per-tensor FP8 matmul's f32 accumulator [rows, n] times row_scale[row] * col_scale[col], rounded once to
+// bf16: what torch._scaled_mm's rowwise mode produces. (cuBLASLt applies outer-vector FP8 scales on Hopper only;
+// Blackwell runs the scalar-scaled matmul and this kernel finishes it.)
+extern "C" __global__ void scale_rows_cols(const float* __restrict__ acc, const float* __restrict__ row_scale,
+                                           const float* __restrict__ col_scale, bf16* __restrict__ out, uint32_t n, uint32_t total) {
+    const uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i >= total) return;
+    const uint32_t row = i / n, col = i - row * n;
+    const float rs = row_scale[row];
+    const float4 a0 = *reinterpret_cast<const float4*>(acc + i);
+    const float4 a1 = *reinterpret_cast<const float4*>(acc + i + 4);
+    const float4 c0 = *reinterpret_cast<const float4*>(col_scale + col);
+    const float4 c1 = *reinterpret_cast<const float4*>(col_scale + col + 4);
+    bf16 o[8] = {f2bf(a0.x * rs * c0.x), f2bf(a0.y * rs * c0.y), f2bf(a0.z * rs * c0.z), f2bf(a0.w * rs * c0.w),
+                 f2bf(a1.x * rs * c1.x), f2bf(a1.y * rs * c1.y), f2bf(a1.z * rs * c1.z), f2bf(a1.w * rs * c1.w)};
+    *reinterpret_cast<uint4*>(out + i) = *reinterpret_cast<uint4*>(o);
+}
+
 // y[rows, n] bf16 += x[rows, n] bf16 (the residual add after the MLP), rounded to bf16.
 extern "C" __global__ void add_inplace(bf16* __restrict__ y, const bf16* __restrict__ x, uint32_t total) {
     const uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) * 8;

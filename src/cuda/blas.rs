@@ -8,7 +8,8 @@
 //! Scales follow cuBLASLt's conventions for each type:
 //! - NVFP4: `VEC16_UE4M3` block scales in the 128x4 tiled ("swizzled") layout for both operands, with the two
 //!   per-tensor decode scales (1 / input_global_scale, 1 / weight_global_scale) folded into alpha.
-//! - FP8: `OUTER_VEC_32F`: one f32 scale per row of the activations and per output column of the weight.
+//! - FP8: per-tensor (scale 1) into an f32 accumulator; the per-row activation and per-column weight scales are
+//!   applied by a kernel afterwards, since `OUTER_VEC_32F` is Hopper-only.
 //!
 //! Descriptors are created per call; cuBLASLt caches heuristics, and a pass makes a few hundred calls, so the
 //! descriptor cost is noise next to the matmuls.
@@ -250,40 +251,34 @@ impl Lt {
         }
     }
 
-    /// `out[M, N] bf16 = (x · w^T)` with x as e4m3 [M, K] and one f32 scale per row.
+    /// `acc[M, N] f32 = xq · wq^T` for e4m3 operands with their per-tensor scales left at 1: the row and column
+    /// scales are applied by `Kernels::scale_rows_cols` afterwards. cuBLASLt's outer-vector FP8 scaling
+    /// (`OUTER_VEC_32F`) runs on Hopper only and returns NOT_SUPPORTED on Blackwell, so the rowwise matmul is
+    /// this scalar one plus a rescale; the products are exact in f32 either way and the result is rounded to bf16
+    /// once, as `torch._scaled_mm` does.
     pub fn fp8(
         &self,
         x_values: &CudaSlice<u8>,
-        x_scale: &CudaSlice<f32>,
         w: &Fp8Weight,
-        out: &mut CudaSlice<u16>,
+        acc: &mut CudaSlice<f32>,
         m: usize,
     ) -> Result<(), CudaError> {
         let (n, k) = (w.n, w.k);
         let m = m.div_ceil(16) * 16;
-        debug_assert!(x_values.len() >= m * k && x_scale.len() >= m && out.len() >= m * n);
+        debug_assert!(x_values.len() >= m * k && acc.len() >= m * n);
         let desc = Desc(
             lt::create_matmul_desc(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, sys::cudaDataType_t::CUDA_R_32F)
                 .map_err(|e| CudaError::Blas(format!("matmul desc: {e:?}")))?,
         );
         unsafe {
-            let mode = sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
-            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode)?;
-            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode)?;
-            let (w_scale, _r1) = w.scale.device_ptr(&self.stream);
-            let (x_scale_ptr, _r2) = x_scale.device_ptr(&self.stream);
-            let w_scale = w_scale as *const c_void;
-            let x_scale_ptr = x_scale_ptr as *const c_void;
-            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_scale)?;
-            set_desc(&desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &x_scale_ptr)?;
             let (w_ptr, _r3) = w.values.device_ptr(&self.stream);
             let (x_ptr, _r4) = x_values.device_ptr(&self.stream);
-            let (out_ptr, _r5) = out.device_ptr_mut(&self.stream);
+            let (acc_ptr, _r5) = acc.device_ptr_mut(&self.stream);
             self.run(
                 &desc,
                 (w_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_8F_E4M3, k as i64),
                 (x_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_8F_E4M3, k as i64),
-                (out_ptr as *mut c_void, sys::cudaDataType_t::CUDA_R_16BF),
+                (acc_ptr as *mut c_void, sys::cudaDataType_t::CUDA_R_32F),
                 m,
                 n,
                 k,
