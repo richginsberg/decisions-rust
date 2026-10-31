@@ -83,6 +83,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.status.is_server_error() {
+            tracing::error!("{}: {}", self.status, self.detail);
+        } else {
+            tracing::debug!("{}: {}", self.status, self.detail);
+        }
         let mut response = (self.status, Json(json!({"detail": self.detail}))).into_response();
         for (name, value) in self.headers {
             if let Ok(value) = HeaderValue::from_str(&value) {
@@ -233,8 +238,15 @@ async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes
     // About how many tokens the request will take, for backpressure: its state once, plus each question.
     let state_text = crate::protocol::describe(&request.state);
     let estimate = encoder.count_tokens(&state_text).unwrap_or(0) + 80 * request.questions.len();
+    let (questions, images, started) = (request.questions.len(), request.images.len(), Instant::now());
     match batcher.submit(request.questions, rows, estimate).await {
         Outcome::Answered(decision) => {
+            tracing::info!(
+                "Decision: {questions} question(s), {images} image(s), {} sequence(s), {} tokens in {:.0} ms",
+                decision.sequences,
+                decision.input_tokens,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
             let answers: serde_json::Map<String, Value> =
                 decision.answers.into_iter().map(|(key, answer)| (key, serde_json::to_value(answer).unwrap_or(Value::Null))).collect();
             Ok(Json(json!({"model": service.name, "answers": answers,
@@ -252,7 +264,17 @@ fn limit_of(model: &dyn crate::model::Model) -> usize {
 async fn request_metadata(request: axum::extract::Request, next: middleware::Next) -> Response {
     let started = Instant::now();
     let id = uuid::Uuid::new_v4().simple().to_string();
+    let (method, path) = (request.method().clone(), request.uri().path().to_string());
     let mut response = next.run(request).await;
+    let status = response.status().as_u16();
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    if status >= 400 {
+        tracing::warn!("{method} {path} -> {status} in {ms:.0} ms [{id}]");
+    } else if path.starts_with("/v1/") && method == axum::http::Method::POST {
+        tracing::info!("{method} {path} -> {status} in {ms:.0} ms [{id}]");
+    } else {
+        tracing::debug!("{method} {path} -> {status} in {ms:.0} ms [{id}]");
+    }
     let headers = response.headers_mut();
     if let Ok(value) = HeaderValue::from_str(&id) {
         headers.insert("x-typesafe-request-id", value.clone());

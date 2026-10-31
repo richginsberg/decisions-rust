@@ -273,6 +273,7 @@ impl Worker {
                 }
             }
             Err(error) => {
+                tracing::error!("Pass of {} row(s) failed: {error}", chosen.len());
                 if chosen.len() == 1 {
                     Self::fail(&chosen[0].0, Failure::from_pass(error));
                 } else {
@@ -296,9 +297,12 @@ impl Worker {
             ids.dedup();
             ids.len()
         };
-        if requests > 1 {
-            tracing::info!("Batched {requests} requests ({} rows) in one pass: {:.0} ms", chosen.len(), elapsed * 1000.0);
-        }
+        tracing::info!(
+            "Pass: {requests} request(s), {} row(s), {tokens} tokens in {:.0} ms ({:.0} tokens/s)",
+            chosen.len(),
+            elapsed * 1000.0,
+            if elapsed > 0.0 { tokens as f64 / elapsed } else { 0.0 }
+        );
         self.prune();
     }
 
@@ -363,7 +367,10 @@ impl Worker {
         };
         match outcome {
             Ok(mut results) => self.record(item, results.remove(0)),
-            Err(error) => Self::fail(job, Failure::from_pass(error)),
+            Err(error) => {
+                tracing::error!("Row of {} tokens failed alone: {error}", job.borrow().rows[*index].length());
+                Self::fail(job, Failure::from_pass(error));
+            }
         }
     }
 
