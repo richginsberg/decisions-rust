@@ -22,8 +22,17 @@ tensor-core paths as before.
 | `src/images.rs` | Image checks and the Qwen2-VL preprocessing (`smart_resize`, patches) |
 | `src/weights.rs` | The checkpoint's safetensors: NVFP4 layouts, memory-mapped shards |
 | `src/config.rs` | `config.json`, `decision_config.json`, `joint_config.json` |
-| `src/cuda/` | (feature `cuda`) the GPU model: weights on the device, kernels, the forward pass |
-| `kernels/*.cu` | CUDA kernels, compiled by `build.rs` into a fatbin for sm_100 and sm_120 |
+| `src/cuda/blas.rs` | (feature `cuda`) cuBLASLt matmuls: NVFP4 block-scaled, FP8 row-scaled, bf16 |
+| `src/cuda/device.rs` | Weights onto the device (FP4 scales re-tiled, gate/up merged, linear-attention projections to FP8), the workspace, the `Model` |
+| `src/cuda/forward.rs` | The text backbone over packed sequences and the readout |
+| `src/cuda/vision.rs` | The vision tower: patches to text-space embeddings |
+| `src/cuda/kernels.rs` | The fatbin and typed launchers for every kernel |
+| `kernels/quant.cu` | NVFP4 / FP8 activation quantization fused with the RMSNorm, residual add and SiLU-gate that feed it |
+| `kernels/attention.cu` | Non-causal attention on the tensor cores (bf16 `mma.sync`, online softmax), text and vision |
+| `kernels/deltanet.cu` | The gated delta rule (chunked, fp32) and its gated RMSNorm |
+| `kernels/layers.cu` | Head norms + multimodal rotary, the causal conv, gathers, LayerNorm, GELU, vision rotary and position embedding |
+| `Dockerfile`, `scripts/start.sh`, `scripts/fetch_model.py` | The image: build with the CUDA toolkit, run on the CUDA runtime, fetch the checkpoint to the volume |
+| `scripts/compare_servers.py` | Send the same decisions to the Python and Rust servers and compare their probabilities |
 | `fixtures/encoder.json` | What the Python encoder produced for 156 requests (`scripts/make_encoder_fixture.py`) |
 
 ## Building and testing without a GPU
@@ -43,10 +52,33 @@ The server also runs end to end with the fake model: `cargo run -- --fake`.
 
 ## Building with the GPU
 
-Needs a CUDA 13 toolkit (`nvcc`) and a Blackwell GPU at runtime:
+Needs a CUDA 13.1+ toolkit (`nvcc`, for the kernels; the `cudarc` bindings are pinned to 13.4) and a Blackwell GPU
+with a CUDA 13 driver at runtime:
 
 ```bash
-cargo build --release --features cuda
+NVCC=/usr/local/cuda/bin/nvcc cargo build --release --features cuda
+```
+
+`DECISION_CUDA_ARCHS` picks the cubins (default `100,120`; `120` alone halves the kernel build for a 5090).
+The toolkit is only needed at build time: the binary loads the driver, cuBLASLt and the embedded fatbin at startup.
+
+## Deploying on RunPod
+
+```bash
+docker build -t decision-rust .            # DECISION_CUDA_ARCHS=120 as --build-arg for a 5090-only image
+docker push <registry>/decision-rust
+```
+
+Start a Pod on an RTX 5090 (or any Blackwell GPU) with a network volume at `/workspace`, HTTP port 8000 exposed,
+and the same environment as the Python server: `AUTOJEV_API_KEY` (required), optionally `DECISION_MODEL_ID` /
+`DECISION_MODEL_REVISION`, `DECISION_MAX_BATCH_TOKENS` and the other limits below. The first start downloads the
+checkpoint (~25 GB) to the volume; later starts load it in about a minute. Clients keep their URL scheme: the
+routes, auth and response shape are the Python server's.
+
+To check the port against the Python server before switching clients:
+
+```bash
+python3 scripts/compare_servers.py https://<python-pod>:8000 https://<rust-pod>:8000 --key $AUTOJEV_API_KEY
 ```
 
 ## Environment
@@ -58,6 +90,14 @@ The Pod's settings carry over: `AUTOJEV_API_KEY` (required),
 
 ## Status
 
-Phase 1 (no GPU): protocol, API, batcher, weights loader, image preprocessing. Phase 2: the kernels and the
-forward pass, checked against logits recorded from the Python server. Phase 3: packing, CUDA graphs, tuning,
-the Docker image and deployment.
+Phase 1 (no GPU): protocol, API, batcher, weights loader, image preprocessing: done and tested.
+
+Phase 2: the kernels, the forward pass (text and vision) and the Docker image are written and compile for
+sm_100 and sm_120, but **have not run on a GPU yet**: the development machine has none. The first run on a
+Blackwell Pod should start with `scripts/compare_servers.py` against the Python server; app.py accepts its own
+optimizations below a 0.2 shift with no top answer changed and typically sees under 0.1. Known simplifications
+to revisit after that: the delta rule runs on CUDA cores (fp32), not tensor cores; the last layer computes every
+token rather than only the marker rows; no CUDA graphs.
+
+Phase 3: tuning (the delta rule and attention on long requests), CUDA graphs for short requests, the memory
+budget on 32 GB GPUs.

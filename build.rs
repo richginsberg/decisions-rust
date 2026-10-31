@@ -1,7 +1,8 @@
 //! Compiles the CUDA kernels in kernels/ to a fatbin for the `cuda` feature.
 //!
-//! Every kernels/*.cu becomes one cubin per architecture in `DECISION_CUDA_ARCHS` (default: sm_100 for
-//! B200-class and sm_120 for RTX 50 / RTX PRO Blackwell), bundled into `$OUT_DIR/kernels.fatbin`, which
+//! The kernels/*.cu files are compiled as one translation unit (nvcc takes a single input per fatbin) into
+//! one cubin per architecture in `DECISION_CUDA_ARCHS` (default: sm_100 for B200-class and sm_120 for RTX 50 /
+//! RTX PRO Blackwell), bundled into `$OUT_DIR/kernels.fatbin`, which
 //! src/cuda/kernels.rs embeds with `include_bytes!` and loads with the driver API at startup. Without
 //! the feature nothing is compiled, so the crate builds on machines without a CUDA toolkit.
 
@@ -25,6 +26,13 @@ fn main() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "cu"))
         .collect();
     sources.sort();
+    // One translation unit including every source, so nvcc builds a single fatbin.
+    let unit = out.join("kernels.cu");
+    let includes: String = sources
+        .iter()
+        .map(|path| format!("#include \"{}\"\n", std::fs::canonicalize(path).unwrap().display()))
+        .collect();
+    std::fs::write(&unit, includes).expect("writing the kernel translation unit");
     let mut command = Command::new(&nvcc);
     command
         .arg("--fatbin")
@@ -39,7 +47,7 @@ fn main() {
         let arch = arch.trim();
         command.arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
     }
-    command.args(&sources);
+    command.arg(&unit);
     let status = command.status().unwrap_or_else(|error| panic!("running {nvcc}: {error}"));
     assert!(status.success(), "nvcc failed on {sources:?}");
 }

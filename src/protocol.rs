@@ -364,6 +364,8 @@ pub struct Encoded {
     pub markers: Vec<usize>,
     /// The image grids, in order, whose pad tokens were expanded into `input_ids`.
     pub images: Vec<ImageGrid>,
+    /// The images' pixels, in the same order, attached by the server for the model's pass (empty in tests).
+    pub pixels: Vec<std::sync::Arc<crate::images::PreparedImage>>,
 }
 
 impl Encoded {
@@ -511,6 +513,7 @@ impl Encoder {
             input_ids,
             markers,
             images: grids.to_vec(),
+            pixels: Vec::new(),
         })
     }
 

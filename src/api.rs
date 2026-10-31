@@ -224,9 +224,12 @@ async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes
         ));
     }
     let encoder = model.encoder();
-    let grids = images::grids(&request.images, model.as_ref()).map_err(|m| ApiError::new(422, m))?;
-    let limit = model.max_length().min(model.budget().max_tokens);
-    let rows = encoder.plan(&request, &grids, Some(limit)).map_err(|error| ApiError::from_failure(Failure::from_protocol(error)))?;
+    let prepared = images::prepare_all(&request.images, model.as_ref()).map_err(|m| ApiError::new(422, m))?;
+    let grids: Vec<_> = prepared.iter().map(|image| image.grid).collect();
+    let mut rows = encoder.plan(&request, &grids, Some(limit_of(model.as_ref()))).map_err(|error| ApiError::from_failure(Failure::from_protocol(error)))?;
+    for row in &mut rows {
+        row.pixels = prepared.clone();
+    }
     // About how many tokens the request will take, for backpressure: its state once, plus each question.
     let state_text = crate::protocol::describe(&request.state);
     let estimate = encoder.count_tokens(&state_text).unwrap_or(0) + 80 * request.questions.len();
@@ -239,6 +242,10 @@ async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes
         }
         Outcome::Failed(failure) => Err(ApiError::from_failure(failure)),
     }
+}
+
+fn limit_of(model: &dyn crate::model::Model) -> usize {
+    model.max_length().min(model.budget().max_tokens)
 }
 
 /// `x-request-id` and `server-timing` on every response, as decider_api.py's middleware adds them.

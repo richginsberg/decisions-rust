@@ -90,6 +90,13 @@ pub struct VisionConfig {
     pub hidden_act: String,
     #[serde(default)]
     pub deepstack_visual_indexes: Vec<usize>,
+    #[serde(default)]
+    pub rope_parameters: Option<VisionRope>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VisionRope {
+    pub rope_theta: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

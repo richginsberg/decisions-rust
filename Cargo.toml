@@ -17,7 +17,7 @@ anyhow = "1"
 axum = { version = "0.8", features = ["json", "http2"] }
 base64 = "0.22"
 bytemuck = { version = "1", features = ["derive"] }
-cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "cublaslt", "fallback-dynamic-loading"] }
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "cublaslt", "nvrtc", "cuda-13040", "fallback-dynamic-loading"] }
 half = { version = "2", features = ["bytemuck", "num-traits"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 memmap2 = "0.9"

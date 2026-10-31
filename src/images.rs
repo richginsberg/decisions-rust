@@ -47,6 +47,7 @@ pub fn smart_resize(height: u32, width: u32, factor: u32, min_pixels: u64, max_p
 }
 
 /// An image decoded, resized, normalized and laid out as the vision tower's patches.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreparedImage {
     pub grid: ImageGrid,
     /// [grid.t * grid.h * grid.w, channels * temporal_patch * patch * patch] in the processor's patch order.
@@ -105,10 +106,10 @@ pub fn prepare(data_url: &str, settings: &ImageSettings) -> Result<PreparedImage
     Ok(PreparedImage { grid, patches })
 }
 
-/// The token grid of each image, for the encoder (the pixels are prepared again by the model's pass).
-pub fn grids(images: &[String], model: &dyn Model) -> Result<Vec<ImageGrid>, String> {
+/// Every image of a request prepared once: the encoder takes the grids, the model's pass the pixels.
+pub fn prepare_all(images: &[String], model: &dyn Model) -> Result<Vec<std::sync::Arc<PreparedImage>>, String> {
     let settings = model.image_settings();
-    images.iter().map(|url| prepare(url, &settings).map(|prepared| prepared.grid)).collect()
+    images.iter().map(|url| prepare(url, &settings).map(std::sync::Arc::new)).collect()
 }
 
 #[cfg(test)]
