@@ -1,0 +1,5 @@
+/target
+/fixtures/large
+*.safetensors
+.env
+.DS_Store

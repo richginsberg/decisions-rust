@@ -1,0 +1,49 @@
+[package]
+name = "decisions-rust-nvfp4"
+version = "0.1.0"
+edition = "2024"
+description = "Serves pplx-decider v1.2 (NVFP4) decisions on one Blackwell GPU: a Rust server over CUDA kernels"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+# The GPU: cudarc, cuBLASLt and the kernels in kernels/*.cu (needs nvcc at build time). Without it the
+# crate builds anywhere, for the encoder, schema and batcher tests and the fake-model server.
+cuda = ["dep:cudarc"]
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json", "http2"] }
+base64 = "0.22"
+bytemuck = { version = "1", features = ["derive"] }
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "cublaslt", "fallback-dynamic-loading"] }
+half = { version = "2", features = ["bytemuck", "num-traits"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+memmap2 = "0.9"
+parking_lot = "0.12"
+safetensors = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+subtle = "2"
+thiserror = "2"
+# 0.21, not 0.23: the newer line depends on daachorse, whose crates.io download Zscaler blocks on the
+# development Macs. tests/encoder.rs checks this version tokenizes exactly as the Python side does.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 1
