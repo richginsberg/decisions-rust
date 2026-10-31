@@ -95,13 +95,15 @@ The Pod's settings carry over: `AUTOJEV_API_KEY` (required),
 Phase 1 (no GPU): protocol, API, batcher, weights loader, image preprocessing: done and tested.
 
 Phase 2: the kernels, the forward pass (text and vision) and the Docker image: done and verified on an RTX 5090
-(2026-10-31). `scripts/compare_servers.py` against the Python server on the same checkpoint: 16 decisions over
-three text states and one image request, no top answer changed, probabilities within 0.048 (0.012 on average);
-app.py accepts its own optimizations below 0.2. Startup is 43 s from a warm volume. Short requests run at about the
-Python server's speed and a 4,300-character one at half of it; profiled (`DECISION_PROFILE=1`), 73% of a 3,400-token pass was the delta rule
-on CUDA cores; it now runs on the tensor cores in fla's three-kernel structure (not yet measured). Still to do: the
-last layer computing every token rather than only the marker rows; no CUDA graphs. Note: on consumer Blackwell cuBLASLt has no rowwise FP8 scaling, so the FP8 projections run with
-scalar scales and a rescale kernel (`scale_rows_cols`).
+(2026-10-31) against the Python server on the same checkpoint: 316 labeled decisions all agree, accuracy 96.5% on
+both; `scripts/compare_servers.py` sees probabilities within 0.07 (0.02 on average), where app.py accepts 0.2.
+On consumer Blackwell cuBLASLt has no rowwise FP8 scaling, so the FP8 projections run with scalar scales and a
+rescale kernel (`scale_rows_cols`).
 
-Phase 3: tuning (the delta rule and attention on long requests), CUDA graphs for short requests, the memory
-budget on 32 GB GPUs.
+Phase 3 (in progress): startup 43 s from a warm volume. Server-side medians on the 5090, proxy excluded, against
+the Python server: 1 question x long input 415 vs 542 ms, 16 x medium 166 vs 317 ms, 16 x short 80 vs 129 ms;
+long inputs 20-25% faster, many-question requests up to 2x. Done: cuBLASLt plans cached per shape; the delta
+rule on the tensor cores in fla's three-kernel structure (it was 73% of a long pass on CUDA cores: 704 of 963
+ms at 3,400 tokens, now 78 of 337); warm-up passes at startup; `DECISION_PROFILE=1` stage timing. Still to do:
+the last layer computing every token rather than only the marker rows; no CUDA graphs.
+

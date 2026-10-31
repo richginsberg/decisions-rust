@@ -228,6 +228,7 @@ async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes
              images. Send the request without images.",
         ));
     }
+    let encode_started = Instant::now();
     let encoder = model.encoder();
     let prepared = images::prepare_all(&request.images, model.as_ref()).map_err(|m| ApiError::new(422, m))?;
     let grids: Vec<_> = prepared.iter().map(|image| image.grid).collect();
@@ -239,6 +240,7 @@ async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes
     let state_text = crate::protocol::describe(&request.state);
     let estimate = encoder.count_tokens(&state_text).unwrap_or(0) + 80 * request.questions.len();
     let (questions, images, started) = (request.questions.len(), request.images.len(), Instant::now());
+    let encode_ms = (started - encode_started).as_secs_f64() * 1000.0;
     match batcher.submit(request.questions, rows, estimate).await {
         Outcome::Answered(decision) => {
             tracing::info!(
@@ -251,9 +253,13 @@ async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes
                 decision.answers.into_iter().map(|(key, answer)| (key, serde_json::to_value(answer).unwrap_or(Value::Null))).collect();
             let mut response = Json(json!({"model": service.name, "answers": answers,
                 "usage": {"input_tokens": decision.input_tokens, "output_tokens": 0, "sequences": decision.sequences}})).into_response();
-            if let Some(profile) = model.last_profile()
-                && let Ok(value) = HeaderValue::from_str(&profile)
-            {
+            // encode: images and tokenization; batch: from submission to the answer (the queue and the pass).
+            let mut timing = format!("encode;dur={encode_ms:.1}, batch;dur={:.1}", started.elapsed().as_secs_f64() * 1000.0);
+            if let Some(profile) = model.last_profile() {
+                timing.push_str(", ");
+                timing.push_str(&profile);
+            }
+            if let Ok(value) = HeaderValue::from_str(&timing) {
                 response.headers_mut().insert("server-timing", value);
             }
             Ok(response)

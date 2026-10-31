@@ -472,7 +472,26 @@ impl GpuModel {
         if profile {
             tracing::warn!("DECISION_PROFILE=1: every pass stage is timed with a sync; expect slower passes");
         }
-        let engine = Engine { stream, lt, kernels, weights: weights_on_device, workspace, profile, last_profile: None };
+        let mut engine = Engine { stream, lt, kernels, weights: weights_on_device, workspace, profile, last_profile: None };
+
+        // Warm up: CUDA loads each kernel on its first launch and cuBLASLt its own on the first call of each
+        // shape, which made the first request after a start take about 2 s. Passes at a few lengths cover the
+        // kernels and the common algorithm choices.
+        let warm_started = std::time::Instant::now();
+        for length in [64usize, 512, 2048] {
+            let length = length.min(max_tokens);
+            let row = Encoded {
+                keys: vec!["warm".into()],
+                counts: vec![2],
+                input_ids: vec![pad_id; length],
+                markers: vec![length - 1],
+                images: Vec::new(),
+                pixels: Vec::new(),
+            };
+            forward::run(&mut engine, &checkpoint, &[&row])?;
+        }
+        engine.last_profile = None;
+        tracing::info!("Warm-up passes done in {:.0} ms", warm_started.elapsed().as_secs_f64() * 1000.0);
         Ok(Self { checkpoint, low_memory, encoder, budget, max_length, engine: Mutex::new(engine), last_profile: Mutex::new(None) })
     }
 }
