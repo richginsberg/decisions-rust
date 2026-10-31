@@ -37,7 +37,8 @@ QUESTIONS = {
 
 def ask(server, key, body):
     request = urllib.request.Request(f"{server.rstrip('/')}/v1/decisions", data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}",
+                                              "User-Agent": "compare-servers/1"})  # RunPod's proxy returns 403 to urllib's default agent
     started = time.time()
     with urllib.request.urlopen(request, timeout=600) as response:
         return json.load(response), time.time() - started
