@@ -103,10 +103,17 @@ impl Weights {
         Ok((view.data(), found))
     }
 
-    /// An f32 scalar (`weight_global_scale`, `input_global_scale`).
+    /// An f32 scalar (`weight_global_scale`, `input_global_scale`); the checkpoint stores these as shape `[1]`,
+    /// older exports as shape `[]`, so one element in any rank is accepted.
     pub fn scalar_f32(&self, name: &str) -> Result<f32, WeightsError> {
-        let (bytes, _) = self.bytes(name, Dtype::F32, &[])?;
-        Ok(f32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+        let view = self.get(name)?;
+        if view.dtype() != Dtype::F32 {
+            return Err(WeightsError::Dtype { name: name.into(), expected: "F32".into(), found: format!("{:?}", view.dtype()) });
+        }
+        if view.shape().iter().product::<usize>() != 1 {
+            return Err(WeightsError::Shape { name: name.into(), expected: vec![1], found: view.shape().to_vec() });
+        }
+        Ok(f32::from_le_bytes(view.data().try_into().expect("4 bytes")))
     }
 
     /// The tensors of one NVFP4 linear layer.
