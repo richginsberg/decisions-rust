@@ -111,7 +111,7 @@ extern "C" __global__ void delta_chunk(const DeltaChunk* __restrict__ chunks, co
                                        const bf16* __restrict__ ab, const float* __restrict__ a_log_exp,
                                        const float* __restrict__ dt_bias, bf16* __restrict__ u_out,
                                        bf16* __restrict__ w_out, bf16* __restrict__ intra,
-                                       float* __restrict__ cum_decay) {
+                                       float* __restrict__ cum_decay, bf16* __restrict__ kt) {
     extern __shared__ __align__(16) unsigned char dsmem[];
     bf16* qs = reinterpret_cast<bf16*>(dsmem);
     bf16* ks = qs + CHUNK * QS;
@@ -197,6 +197,25 @@ extern "C" __global__ void delta_chunk(const DeltaChunk* __restrict__ chunks, co
     }
     __syncthreads();
 
+    // k~^T for delta_state: (k exp(cum_last - cum_j))^T as [128][64] bf16 per (chunk, head), written once here
+    // rather than by each of the four state blocks.
+    {
+        const int len = (int)min(remaining, (uint32_t)CHUNK);
+        const float cum_last = cum[len - 1];
+        bf16* kt_out = kt + ((size_t)blockIdx.x * V_HEADS + h) * DK * CHUNK;
+        for (int i = threadIdx.x; i < DK * (CHUNK / 8); i += blockDim.x) {
+            const int d = i >> 3, j0 = (i & 7) * 8;
+            uint4 packed;
+            bf16* pp = reinterpret_cast<bf16*>(&packed);
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const int j = j0 + e;
+                pp[e] = f2bf(bf2f(ks[j * QS + d]) * __expf(cum_last - cum[j]));
+            }
+            *reinterpret_cast<uint4*>(kt_out + d * CHUNK + j0) = packed;
+        }
+    }
+
     // Forward substitution with the unit lower triangular (I + A), fully unrolled so x stays in registers:
     // threads 0..127 solve u (column of v beta), threads 128..255 solve w (column of k beta exp(cum)).
     {
@@ -237,7 +256,7 @@ extern "C" __global__ void delta_chunk(const DeltaChunk* __restrict__ chunks, co
 #define DELTA_STATE_SMEM (CHUNK * QS * 2 + STATE_ROWS * TS * 2 + DK * TS * 2 + CHUNK * 4)
 
 extern "C" __global__ void delta_state(const DeltaSeq* __restrict__ seqs, const DeltaChunk* __restrict__ chunks,
-                                       const bf16* __restrict__ qkv, const bf16* __restrict__ u_in,
+                                       const bf16* __restrict__ kt_in, const bf16* __restrict__ u_in,
                                        const bf16* __restrict__ w_in, const float* __restrict__ cum_decay,
                                        bf16* __restrict__ states, bf16* __restrict__ vnew_out) {
     extern __shared__ __align__(16) unsigned char dsmem[];
@@ -246,7 +265,7 @@ extern "C" __global__ void delta_state(const DeltaSeq* __restrict__ seqs, const 
     bf16* kT = vT + STATE_ROWS * TS;             // [128][TS]: (k exp(cum_last - cum))^T
     float* cum = reinterpret_cast<float*>(kT + DK * TS);
     const DeltaSeq s = seqs[blockIdx.x];
-    const uint32_t h = blockIdx.y, kh = h / 3;
+    const uint32_t h = blockIdx.y;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int nbase = blockIdx.z * STATE_ROWS;   // first value dim of this block
     const int wrow = warp * 16;                  // this warp's first row within the block's 32
@@ -273,16 +292,9 @@ extern "C" __global__ void delta_state(const DeltaSeq* __restrict__ seqs, const 
             *reinterpret_cast<uint32_t*>(st + (n + 8) * DK + d) = pack_bf16(hT[nt][2], hT[nt][3]);
         }
         stage_rows(ws, QS, w_in + ((size_t)tok0 * V_HEADS + h) * DV, (size_t)V_HEADS * DV, CHUNK, DV, len);
-        __syncthreads(); // cum
+        stage_rows(kT, TS, kt_in + ((size_t)chunk * V_HEADS + h) * DK * CHUNK, CHUNK, DK, CHUNK, DK);
+        __syncthreads(); // cum, ws, kT
         const float cum_last = cum[len - 1];
-        for (int row = warp; row < CHUNK; row += 2) {
-            float k4[4] = {0.f, 0.f, 0.f, 0.f};
-            if (row < len) load_l2norm_lane(qkv, tok0 + row, 2048, kh, k4);
-            const float f = __expf(cum_last - cum[row]);
-#pragma unroll
-            for (int i = 0; i < 4; i++) kT[(lane * 4 + i) * TS + row] = f2bf(k4[i] * f);
-        }
-        __syncthreads(); // ws, kT
 
         // v_new = u - w S for this warp's 16 columns, one 8-column tile at a time; S as B fragments from hT
         // (rows g for tile 0, rows g + 8 for tile 1).

@@ -135,6 +135,7 @@ pub struct Workspace {
     pub delta_intra: CudaSlice<u16>,
     pub delta_states: CudaSlice<u16>,
     pub delta_vnew: CudaSlice<u16>,
+    pub delta_kt: CudaSlice<u16>,
     pub max_chunks: usize,
     pub positions: CudaSlice<i32>,
     pub seq_of: CudaSlice<i32>,
@@ -494,6 +495,8 @@ impl GpuModel {
             forward::run(&mut engine, &checkpoint, &[&row])?;
         }
         engine.last_profile = None;
+        // The tokenizer builds its pre-tokenizer regexes on first use; one encode pays that before serving.
+        let _ = encoder.count_tokens(&"The dashboard shows 'No data' after the update; the raw table has rows. ".repeat(40));
         tracing::info!("{passes} warm-up passes in {:.0} ms", warm_started.elapsed().as_secs_f64() * 1000.0);
         Ok(Self { checkpoint, low_memory, encoder, budget, max_length, engine: Mutex::new(engine), last_profile: Mutex::new(None) })
     }
@@ -538,6 +541,7 @@ impl Workspace {
             delta_intra: stream.alloc_zeros(max_chunks * heads * 64 * 64)?,
             delta_states: stream.alloc_zeros(max_chunks * heads * text.linear_key_head_dim * text.linear_value_head_dim)?,
             delta_vnew: stream.alloc_zeros(max_chunks * heads * text.linear_value_head_dim * 64)?,
+            delta_kt: stream.alloc_zeros(max_chunks * heads * text.linear_key_head_dim * 64)?,
             max_chunks,
             positions: stream.alloc_zeros(n * 3)?,
             seq_of: stream.alloc_zeros(n)?,
