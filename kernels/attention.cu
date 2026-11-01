@@ -59,6 +59,7 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
     bf16* smem = reinterpret_cast<bf16*>(attn_smem);
 
     const AttnTile tile = tiles[blockIdx.x];
+    if (tile.seq_len == 0) return; // a padding entry of a fixed-size tile table (the whole block leaves)
     const uint32_t head = blockIdx.y;
     const uint32_t kv_head = head / (heads / kv_heads);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;

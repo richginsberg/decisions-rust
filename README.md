@@ -90,6 +90,8 @@ The Pod's settings carry over: `AUTOJEV_API_KEY` (required),
 `DECISION_AUTOTUNE` (1): during the warm-up passes at load (every row bucket to 4096 tokens), time cuBLASLt's
 candidate algorithms for each matmul shape of 512 rows or more and keep the fastest; shapes first met on a live
 request take the heuristic's first choice (0 does so always).
+`DECISION_GRAPHS` (1): replay a captured CUDA graph of the text layers for requests without images in the
+buckets warmed at load (to 4096 tokens), instead of some 700 kernel launches; 0 launches eagerly.
 `DECISION_PROFILE` (0): with 1, every pass stage is timed (a stream sync after each) and reported in the
 `server-timing` response header and the log; for profiling only, since the syncs slow passes down.
 

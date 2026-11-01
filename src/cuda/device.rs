@@ -13,6 +13,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use parking_lot::Mutex;
 
 use super::blas::{ROW_BUCKET, ROW_BUCKET_FROM, ROW_BUCKET_LARGE, bucket_rows, Bf16Weight, Fp4Weight, Fp8Weight, Lt, swizzled_scale_bytes, swizzled_scale_index};
+use super::graph::Graphs;
 use super::kernels::Kernels;
 use super::{CudaError, forward};
 use crate::config::Checkpoint;
@@ -137,9 +138,19 @@ pub struct Workspace {
     pub delta_vnew: CudaSlice<u16>,
     pub delta_kt: CudaSlice<u16>,
     pub max_chunks: usize,
+    /// The pass's tables, sized for the largest bucket: [max_tokens] ids and sequence starts, [max_tokens, 3]
+    /// positions, attention tiles (3 u32 each), delta chunks and sequences (4 u32 each), readout markers.
     pub positions: CudaSlice<i32>,
     pub seq_of: CudaSlice<i32>,
     pub ids: CudaSlice<i32>,
+    pub attn_tiles: CudaSlice<u32>,
+    pub delta_chunks: CudaSlice<u32>,
+    pub delta_seqs: CudaSlice<u32>,
+    pub markers: CudaSlice<i32>,
+    /// [max_tokens, options] f32: the readout logits.
+    pub logits: CudaSlice<f32>,
+    /// Sequences (rows) a pass may hold: the batch limit.
+    pub max_seqs: usize,
     /// Vision: patches x hidden and the wider intermediates.
     pub max_patches: usize,
     pub vx: CudaSlice<u16>,
@@ -163,6 +174,8 @@ pub struct Engine {
     pub profile: bool,
     /// The last pass's stage report, for the response's server-timing header.
     pub last_profile: Option<String>,
+    /// Captured graphs of the text layers, per row bucket (DECISION_GRAPHS=0 disables them).
+    pub graphs: Graphs,
 }
 
 pub struct GpuModel {
@@ -359,7 +372,10 @@ impl GpuModel {
         let max_length: usize = std::env::var("DECISION_MAX_LENGTH").ok().and_then(|v| v.parse().ok()).unwrap_or(32768);
 
         let ctx = CudaContext::new(0)?;
-        let stream = ctx.default_stream();
+        // One stream, so cudarc's per-buffer event tracking (meant for several) is pure overhead, and it would
+        // record events inside graph captures. Capture needs a created stream, not the legacy default one.
+        unsafe { ctx.disable_event_tracking() };
+        let stream = ctx.new_stream()?;
         let (free, total) = ctx.mem_get_info()?;
         tracing::info!("GPU 0: {:.1} GiB free of {:.1} GiB", free as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
         let kernels = Kernels::load(stream.clone())?;
@@ -468,14 +484,15 @@ impl GpuModel {
 
         // A multiple of the row bucket: the activation matmuls round their row count up to one.
         let max_tokens = bucket_rows(budget.max_tokens.max(ROW_BUCKET));
-        let workspace = Workspace::allocate(&stream, &checkpoint, max_tokens, !low_memory)?;
+        let workspace = Workspace::allocate(&stream, &checkpoint, max_tokens, !low_memory, budget.max_rows.max(1), weights_on_device.readout.n)?;
         let (free_after, _) = ctx.mem_get_info()?;
         tracing::info!("Weights and workspace on the device; {:.1} GiB free", free_after as f64 / (1u64 << 30) as f64);
         let profile = std::env::var("DECISION_PROFILE").is_ok_and(|v| v == "1");
         if profile {
             tracing::warn!("DECISION_PROFILE=1: every pass stage is timed with a sync; expect slower passes");
         }
-        let mut engine = Engine { stream, lt, kernels, weights: weights_on_device, workspace, profile, last_profile: None };
+        let graphs = Graphs::new(stream.clone());
+        let mut engine = Engine { stream, lt, kernels, weights: weights_on_device, workspace, profile, last_profile: None, graphs };
 
         // Warm up: CUDA loads each kernel on its first launch and cuBLASLt its own on the first call of each
         // row bucket (the first request after a start took about 2 s, and the first of each new length 50 to
@@ -484,9 +501,8 @@ impl GpuModel {
         // only during these passes, so a longer request's first bucket costs a plan but no tuning.
         let warm_started = std::time::Instant::now();
         let mut passes = 0;
-        let lengths = (ROW_BUCKET..=ROW_BUCKET_FROM).step_by(ROW_BUCKET).chain((ROW_BUCKET_FROM + ROW_BUCKET_LARGE..=4096).step_by(ROW_BUCKET_LARGE));
         engine.lt.set_tuning(true);
-        for length in lengths.filter(|&l| l <= max_tokens) {
+        for length in warm_lengths(max_tokens) {
             passes += 1;
             let row = Encoded {
                 keys: vec!["warm".into()],
@@ -500,6 +516,15 @@ impl GpuModel {
         }
         engine.lt.set_tuning(false);
         engine.last_profile = None;
+        // A graph of the text layers per warmed bucket: replayed in one call instead of about 700 launches.
+        let use_graphs = std::env::var("DECISION_GRAPHS").map_or(true, |v| v != "0") && !low_memory && !profile;
+        if use_graphs {
+            let capture_started = std::time::Instant::now();
+            for length in warm_lengths(max_tokens) {
+                forward::capture(&mut engine, &checkpoint, length)?;
+            }
+            tracing::info!("{} graphs captured in {:.0} ms", engine.graphs.len(), capture_started.elapsed().as_secs_f64() * 1000.0);
+        }
         // The tokenizer builds its pre-tokenizer regexes on first use; one encode pays that before serving.
         let _ = encoder.count_tokens(&"The dashboard shows 'No data' after the update; the raw table has rows. ".repeat(40));
         tracing::info!("{passes} warm-up passes in {:.0} ms", warm_started.elapsed().as_secs_f64() * 1000.0);
@@ -507,8 +532,16 @@ impl GpuModel {
     }
 }
 
+/// The buckets warmed, tuned and captured at load: 64 apart to 2048 tokens, then 256 apart to 4096.
+fn warm_lengths(max_tokens: usize) -> impl Iterator<Item = usize> {
+    (ROW_BUCKET..=ROW_BUCKET_FROM)
+        .step_by(ROW_BUCKET)
+        .chain((ROW_BUCKET_FROM + ROW_BUCKET_LARGE..=4096).step_by(ROW_BUCKET_LARGE))
+        .filter(move |&l| l <= max_tokens)
+}
+
 impl Workspace {
-    fn allocate(stream: &Arc<CudaStream>, checkpoint: &Checkpoint, n: usize, vision: bool) -> Result<Self, CudaError> {
+    fn allocate(stream: &Arc<CudaStream>, checkpoint: &Checkpoint, n: usize, vision: bool, max_seqs: usize, options: usize) -> Result<Self, CudaError> {
         let text = &checkpoint.model.text_config;
         let vc = &checkpoint.model.vision_config;
         let hidden = text.hidden_size;
@@ -516,7 +549,8 @@ impl Workspace {
         let qkv_dim = text.linear_qkv_dim();
         let v_dim = text.linear_value_dim();
         let heads = text.linear_num_value_heads;
-        let max_chunks = n.div_ceil(super::kernels::DELTA_CHUNK) + 64;
+        let counts = forward::Counts::of(n, max_seqs);
+        let max_chunks = counts.chunks;
         let max_patches = if vision { MAX_IMAGES * (checkpoint.image_processor.size.longest_edge as usize / (vc.patch_size * vc.patch_size)) } else { 64 };
         let max_patches = bucket_rows(max_patches);
         let vh = vc.hidden_size;
@@ -551,6 +585,12 @@ impl Workspace {
             positions: stream.alloc_zeros(n * 3)?,
             seq_of: stream.alloc_zeros(n)?,
             ids: stream.alloc_zeros(n)?,
+            attn_tiles: stream.alloc_zeros(3 * counts.tiles)?,
+            delta_chunks: stream.alloc_zeros(4 * counts.chunks)?,
+            delta_seqs: stream.alloc_zeros(4 * counts.seqs)?,
+            markers: stream.alloc_zeros(n)?,
+            logits: stream.alloc_zeros(n * options)?,
+            max_seqs,
             max_patches,
             vx: stream.alloc_zeros(max_patches * vh)?,
             vnormed: stream.alloc_zeros(max_patches * vh)?,

@@ -9,6 +9,7 @@
 pub mod blas;
 pub mod device;
 pub mod forward;
+pub mod graph;
 pub mod kernels;
 pub mod vision;
 

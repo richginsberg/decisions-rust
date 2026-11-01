@@ -15,7 +15,11 @@
 
 use cudarc::driver::CudaStream;
 use super::CudaError;
-use super::device::{Embeddings, Engine, Mixer};
+use std::sync::Arc;
+
+use super::blas::Lt;
+use super::device::{DeviceWeights, Embeddings, Engine, Mixer, Workspace};
+use super::kernels::Kernels;
 use super::kernels::{ATTENTION_QUERIES, DELTA_CHUNK, Ptr};
 use super::vision;
 use crate::config::Checkpoint;
@@ -115,6 +119,24 @@ impl Pack {
     }
 }
 
+/// The launch counts of a pass over a bucket of rows: the table-driven kernels run this many blocks and skip
+/// the padding entries of their tables, so every launch (and a captured graph of them) depends only on the
+/// bucket, not on the request's sequence layout.
+#[derive(Clone, Copy)]
+pub struct Counts {
+    pub rows: usize,
+    pub tiles: usize,
+    pub chunks: usize,
+    pub seqs: usize,
+}
+
+impl Counts {
+    /// Each sequence adds at most one partial attention tile and one partial delta chunk.
+    pub fn of(rows: usize, max_seqs: usize) -> Self {
+        Self { rows, tiles: rows / ATTENTION_QUERIES + max_seqs, chunks: rows / DELTA_CHUNK + max_seqs, seqs: max_seqs }
+    }
+}
+
 /// The pass, from encoded rows to each question's probabilities.
 pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> Result<Vec<RowAnswers>, CudaError> {
     let text = &checkpoint.model.text_config;
@@ -124,61 +146,138 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
     if n == 0 {
         return Ok(rows.iter().map(|_| Vec::new()).collect());
     }
-    if n > engine.workspace.max_tokens {
+    let nb = super::blas::bucket_rows(n);
+    if nb > engine.workspace.max_tokens {
         return Err(CudaError::Invalid(format!("a pass of {n} tokens exceeds the workspace of {}", engine.workspace.max_tokens)));
     }
+    if pack.seqs.len() > engine.workspace.max_seqs {
+        return Err(CudaError::Invalid(format!("a pass of {} sequences exceeds the batch limit of {}", pack.seqs.len(), engine.workspace.max_seqs)));
+    }
+    let counts = Counts::of(nb, engine.workspace.max_seqs);
     let stream = engine.stream.clone();
     let mut timer = Timer::new(engine.profile, &stream);
     let eps = text.rms_norm_eps as f32;
     let hidden = text.hidden_size;
+    let Engine { stream: _, lt, kernels, weights, workspace: ws, profile, last_profile, graphs } = engine;
 
-    // Inputs.
-    let ids = stream.clone_htod(&pack.ids)?;
-    let positions = stream.clone_htod(&pack.positions)?;
-    let seq_of = stream.clone_htod(&pack.seq_of)?;
-    let attn_tiles = stream.clone_htod(&pack.attn_tiles)?;
-    let delta_chunks = stream.clone_htod(&pack.delta_chunks)?;
-    let delta_seqs = stream.clone_htod(&pack.delta_seqs)?;
-    let n_tiles = pack.attn_tiles.len() / 3;
-    let n_chunks = pack.delta_chunks.len() / 4;
-    if n_chunks > engine.workspace.max_chunks {
-        return Err(CudaError::Invalid("too many sequences for the delta-rule workspace".into()));
-    }
-
+    upload(&stream, ws, &pack, &counts)?;
     timer.tick("inputs");
 
-    // Embeddings.
-    let Engine { stream: _, lt, kernels, weights, workspace: ws, profile: _, last_profile } = engine;
-    match &weights.embeddings {
-        Embeddings::Device(table) => kernels.gather_rows(table, &ids, &mut ws.h, n, hidden)?,
-        Embeddings::Host { weights: host, name } => {
-            let (bytes, _) = host.bf16(name, &[Some(text.vocab_size), Some(hidden)])?;
-            let mut gathered = vec![0u16; n * hidden];
-            for (i, &id) in pack.ids.iter().enumerate() {
-                let src = &bytes[id as usize * hidden * 2..(id as usize + 1) * hidden * 2];
-                for (j, pair) in src.chunks_exact(2).enumerate() {
-                    gathered[i * hidden + j] = u16::from_le_bytes([pair[0], pair[1]]);
+    let device_table = match &weights.embeddings {
+        Embeddings::Device(table) => Some(table),
+        Embeddings::Host { .. } => None,
+    };
+    let replayed = pack.images.is_empty() && !*profile && device_table.is_some() && graphs.launch(nb)?;
+    match replayed {
+        true => {}
+        false => {
+            match &weights.embeddings {
+                Embeddings::Device(table) => kernels.gather_rows(table, &ws.ids, &mut ws.h, nb, hidden)?,
+                Embeddings::Host { weights: host, name } => {
+                    let (bytes, _) = host.bf16(name, &[Some(text.vocab_size), Some(hidden)])?;
+                    let mut gathered = vec![0u16; n * hidden];
+                    for (i, &id) in pack.ids.iter().enumerate() {
+                        let src = &bytes[id as usize * hidden * 2..(id as usize + 1) * hidden * 2];
+                        for (j, pair) in src.chunks_exact(2).enumerate() {
+                            gathered[i * hidden + j] = u16::from_le_bytes([pair[0], pair[1]]);
+                        }
+                    }
+                    let mut view = ws.h.slice_mut(0..n * hidden);
+                    stream.memcpy_htod(&gathered, &mut view)?;
                 }
             }
-            let mut view = ws.h.slice_mut(0..n * hidden);
-            stream.memcpy_htod(&gathered, &mut view)?;
+            if !pack.images.is_empty() {
+                let Some(vision_weights) = &weights.vision else {
+                    return Err(CudaError::Invalid("This server runs text-only (low memory mode), so it can't read images.".into()));
+                };
+                let images: Vec<&crate::images::PreparedImage> = pack.images.iter().map(|&(row, i)| rows[row].pixels[i].as_ref()).collect();
+                let merged = vision::run(&stream, lt, kernels, vision_weights, ws, checkpoint, &images)?;
+                if merged != pack.image_tokens.len() {
+                    return Err(CudaError::Invalid("the vision tower produced a different number of tokens than the prompt holds".into()));
+                }
+                let image_tokens = stream.clone_htod(&pack.image_tokens)?;
+                kernels.scatter_rows(&ws.vembeds, &image_tokens, &mut ws.h, merged, hidden)?;
+                timer.tick("vision");
+            }
+            timer.tick("embed");
+            layers(lt, kernels, weights, ws, text, &counts, &stream, &mut timer)?;
         }
     }
-    if !pack.images.is_empty() {
-        let Some(vision_weights) = &weights.vision else {
-            return Err(CudaError::Invalid("This server runs text-only (low memory mode), so it can't read images.".into()));
-        };
-        let images: Vec<&crate::images::PreparedImage> = pack.images.iter().map(|&(row, i)| rows[row].pixels[i].as_ref()).collect();
-        let merged = vision::run(&stream, lt, kernels, vision_weights, ws, checkpoint, &images)?;
-        if merged != pack.image_tokens.len() {
-            return Err(CudaError::Invalid("the vision tower produced a different number of tokens than the prompt holds".into()));
-        }
-        let image_tokens = stream.clone_htod(&pack.image_tokens)?;
-        kernels.scatter_rows(&ws.vembeds, &image_tokens, &mut ws.h, merged, hidden)?;
-        timer.tick("vision");
-    }
-    timer.tick("embed");
 
+    // Readout at the markers.
+    let m = pack.markers.len();
+    kernels.gather_rows(&ws.h, &ws.markers, &mut ws.out, m, hidden)?;
+    kernels.rms_norm(&ws.out, None, &weights.final_norm, &mut ws.normed, m, hidden, eps)?;
+    let options = weights.readout.n;
+    lt.bf16_to_f32(&ws.normed, &weights.readout, &mut ws.logits, m)?;
+    let mut host = vec![0f32; m * options];
+    stream.memcpy_dtoh(&ws.logits.slice(0..m * options), &mut host)?;
+    stream.synchronize()?;
+    timer.tick("readout");
+    if let Some(report) = timer.report(n) {
+        tracing::info!("{report}");
+        *last_profile = Some(report);
+    }
+
+    let temperature = checkpoint.decision.temperature as f32;
+    let mut cursor = 0;
+    let mut answers = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut row_answers = Vec::with_capacity(row.counts.len());
+        for &count in &row.counts {
+            let logits = &host[cursor * options..cursor * options + count];
+            row_answers.push(softmax(logits, temperature));
+            cursor += 1;
+        }
+        answers.push(row_answers);
+    }
+    Ok(answers)
+}
+
+/// The pass's tables into the workspace's fixed buffers, zero-padded to the bucket's sizes (padding rows get
+/// id 0, position 0 and themselves as sequence start, so the conv reads nothing before them).
+fn upload(stream: &Arc<CudaStream>, ws: &mut Workspace, pack: &Pack, counts: &Counts) -> Result<(), CudaError> {
+    fn padded<T: Copy + Default>(values: &[T], len: usize) -> Vec<T> {
+        let mut v = values.to_vec();
+        v.resize(len, T::default());
+        v
+    }
+    if pack.attn_tiles.len() / 3 > counts.tiles || pack.delta_chunks.len() / 4 > counts.chunks || pack.delta_seqs.len() / 4 > counts.seqs {
+        return Err(CudaError::Invalid("the pass needs more attention tiles or delta chunks than its bucket allows".into()));
+    }
+    let n = pack.n;
+    let mut seq_of = padded(&pack.seq_of, counts.rows);
+    for (i, s) in seq_of.iter_mut().enumerate().skip(n) {
+        *s = i as i32;
+    }
+    stream.memcpy_htod(&padded(&pack.ids, counts.rows), &mut ws.ids.slice_mut(0..counts.rows))?;
+    stream.memcpy_htod(&padded(&pack.positions, 3 * counts.rows), &mut ws.positions.slice_mut(0..3 * counts.rows))?;
+    stream.memcpy_htod(&seq_of, &mut ws.seq_of.slice_mut(0..counts.rows))?;
+    stream.memcpy_htod(&padded(&pack.attn_tiles, 3 * counts.tiles), &mut ws.attn_tiles.slice_mut(0..3 * counts.tiles))?;
+    stream.memcpy_htod(&padded(&pack.delta_chunks, 4 * counts.chunks), &mut ws.delta_chunks.slice_mut(0..4 * counts.chunks))?;
+    stream.memcpy_htod(&padded(&pack.delta_seqs, 4 * counts.seqs), &mut ws.delta_seqs.slice_mut(0..4 * counts.seqs))?;
+    if !pack.markers.is_empty() {
+        stream.memcpy_htod(&pack.markers, &mut ws.markers.slice_mut(0..pack.markers.len()))?;
+    }
+    Ok(())
+}
+
+/// The 64 text layers over the bucket's rows, from the embeddings in `h` to the final hidden states in `h`.
+/// Capturable: every launch depends only on `counts`.
+#[allow(clippy::too_many_arguments)]
+fn layers(
+    lt: &Lt,
+    kernels: &Kernels,
+    weights: &DeviceWeights,
+    ws: &mut Workspace,
+    text: &crate::config::TextConfig,
+    counts: &Counts,
+    stream: &Arc<CudaStream>,
+    timer: &mut Timer,
+) -> Result<(), CudaError> {
+    let n = counts.rows;
+    let eps = text.rms_norm_eps as f32;
+    let hidden = text.hidden_size;
     // The layers.
     for layer in &weights.layers {
         match &layer.mixer {
@@ -197,13 +296,13 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
                 timer.tick("fp8mm");
                 lt.bf16_padded(&ws.normed, &lin.ab, &mut ws.ab, n)?;
                 timer.tick("bf16mm");
-                kernels.conv1d_silu_scaled(&ws.fp8_acc, &ws.fp8_scales, &lin.qkv.scale, &lin.conv, &seq_of, &mut ws.mid, n, qkv_dim)?;
+                kernels.conv1d_silu_scaled(&ws.fp8_acc, &ws.fp8_scales, &lin.qkv.scale, &lin.conv, &ws.seq_of, &mut ws.mid, n, qkv_dim)?;
                 timer.tick("conv");
-                kernels.delta_chunk(&delta_chunks, n_chunks, &ws.mid, &ws.ab, &lin.a_log_exp, &lin.dt_bias, &mut ws.delta_u, &mut ws.delta_w, &mut ws.delta_intra, &mut ws.cum_decay, &mut ws.delta_kt)?;
+                kernels.delta_chunk(&ws.delta_chunks, counts.chunks, &ws.mid, &ws.ab, &lin.a_log_exp, &lin.dt_bias, &mut ws.delta_u, &mut ws.delta_w, &mut ws.delta_intra, &mut ws.cum_decay, &mut ws.delta_kt)?;
                 timer.tick("delta.chunk");
-                kernels.delta_state(&delta_seqs, pack.seqs.len(), &delta_chunks, &ws.delta_kt, &ws.delta_u, &ws.delta_w, &ws.cum_decay, &mut ws.delta_states, &mut ws.delta_vnew)?;
+                kernels.delta_state(&ws.delta_seqs, counts.seqs, &ws.delta_chunks, &ws.delta_kt, &ws.delta_u, &ws.delta_w, &ws.cum_decay, &mut ws.delta_states, &mut ws.delta_vnew)?;
                 timer.tick("delta.state");
-                kernels.delta_out(&delta_chunks, n_chunks, &ws.mid, &ws.cum_decay, &ws.delta_intra, &ws.delta_states, &ws.delta_vnew, &mut ws.mixed)?;
+                kernels.delta_out(&ws.delta_chunks, counts.chunks, &ws.mid, &ws.cum_decay, &ws.delta_intra, &ws.delta_states, &ws.delta_vnew, &mut ws.mixed)?;
                 timer.tick("delta.out");
                 // mixed holds the delta-rule output [N, 48, 128]; the gated norm writes out_proj's input (into
                 // `wide`, whose qkv the conv has consumed).
@@ -223,20 +322,20 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
                 timer.tick("norm");
                 // q, k and v share the normed input; it is quantized once per distinct input scale.
                 let mut quantized_for = f32::NAN;
-                fp4_project(kernels, lt, &stream, &ws.normed, &mut ws.fp4_packed, &mut ws.fp4_scales, &mut quantized_for, &full.q, &mut ws.wide, n, hidden)?;
+                fp4_project(kernels, lt, stream, &ws.normed, &mut ws.fp4_packed, &mut ws.fp4_scales, &mut quantized_for, &full.q, &mut ws.wide, n, hidden)?;
                 timer.tick("fp4mm");
-                fp4_project(kernels, lt, &stream, &ws.normed, &mut ws.fp4_packed, &mut ws.fp4_scales, &mut quantized_for, &full.k, &mut ws.mid, n, hidden)?;
+                fp4_project(kernels, lt, stream, &ws.normed, &mut ws.fp4_packed, &mut ws.fp4_scales, &mut quantized_for, &full.k, &mut ws.mid, n, hidden)?;
                 timer.tick("fp4mm");
-                fp4_project(kernels, lt, &stream, &ws.normed, &mut ws.fp4_packed, &mut ws.fp4_scales, &mut quantized_for, &full.v, &mut ws.v, n, hidden)?;
+                fp4_project(kernels, lt, stream, &ws.normed, &mut ws.fp4_packed, &mut ws.fp4_scales, &mut quantized_for, &full.v, &mut ws.v, n, hidden)?;
                 timer.tick("fp4mm");
                 let rot = text.rotary_dim();
-                kernels.head_norm_rotary(&ws.wide, &ws.mid, &full.q_norm, &full.k_norm, &positions, &mut ws.z, &mut ws.k_rot, n, heads, kv_heads, rot, text.rope_parameters.rope_theta as f32, eps)?;
+                kernels.head_norm_rotary(&ws.wide, &ws.mid, &full.q_norm, &full.k_norm, &ws.positions, &mut ws.z, &mut ws.k_rot, n, heads, kv_heads, rot, text.rope_parameters.rope_theta as f32, eps)?;
                 timer.tick("rope");
-                let gate = Ptr::of(&ws.wide, head_dim, &stream);
+                let gate = Ptr::of(&ws.wide, head_dim, stream);
                 let scale = 1.0 / (head_dim as f32).sqrt();
-                kernels.attention(&attn_tiles, n_tiles, &ws.z, &ws.k_rot, &ws.v, gate, &mut ws.mixed, heads, kv_heads, scale)?;
+                kernels.attention(&ws.attn_tiles, counts.tiles, &ws.z, &ws.k_rot, &ws.v, gate, &mut ws.mixed, heads, kv_heads, scale)?;
                 timer.tick("attention");
-                kernels.quantize_fp4(Ptr::of(&ws.mixed, 0, &stream), &mut ws.fp4_packed, &mut ws.fp4_scales, n, heads * head_dim, full.o.input_encode)?;
+                kernels.quantize_fp4(Ptr::of(&ws.mixed, 0, stream), &mut ws.fp4_packed, &mut ws.fp4_scales, n, heads * head_dim, full.o.input_encode)?;
                 timer.tick("quant4");
                 lt.fp4(&ws.fp4_packed, &ws.fp4_scales, &full.o, &mut ws.out, n)?;
                 timer.tick("fp4mm");
@@ -258,36 +357,30 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
         timer.tick("add");
     }
 
-    // Readout at the markers.
-    let m = pack.markers.len();
-    let markers = stream.clone_htod(&pack.markers)?;
-    kernels.gather_rows(&ws.h, &markers, &mut ws.out, m, hidden)?;
-    kernels.rms_norm(&ws.out, None, &weights.final_norm, &mut ws.normed, m, hidden, eps)?;
-    let options = weights.readout.n;
-    let mut logits = stream.alloc_zeros::<f32>(m * options)?;
-    lt.bf16_to_f32(&ws.normed, &weights.readout, &mut logits, m)?;
-    let mut host = vec![0f32; m * options];
-    stream.memcpy_dtoh(&logits, &mut host)?;
-    stream.synchronize()?;
-    timer.tick("readout");
-    if let Some(report) = timer.report(n) {
-        tracing::info!("{report}");
-        *last_profile = Some(report);
-    }
+    Ok(())
+}
 
-    let temperature = checkpoint.decision.temperature as f32;
-    let mut cursor = 0;
-    let mut answers = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut row_answers = Vec::with_capacity(row.counts.len());
-        for &count in &row.counts {
-            let logits = &host[cursor * options..cursor * options + count];
-            row_answers.push(softmax(logits, temperature));
-            cursor += 1;
-        }
-        answers.push(row_answers);
+/// Record the embedding gather and the layers of one bucket as a graph (nothing runs; the plans must exist,
+/// which the warm-up passes ensure).
+pub fn capture(engine: &mut Engine, checkpoint: &Checkpoint, rows: usize) -> Result<(), CudaError> {
+    let text = &checkpoint.model.text_config;
+    let counts = Counts::of(rows, engine.workspace.max_seqs);
+    let stream = engine.stream.clone();
+    let Engine { stream: _, lt, kernels, weights, workspace: ws, profile: _, last_profile: _, graphs } = engine;
+    let Embeddings::Device(table) = &weights.embeddings else {
+        return Ok(());
+    };
+    graphs.begin()?;
+    let recorded = (|| -> Result<(), CudaError> {
+        kernels.gather_rows(table, &ws.ids, &mut ws.h, rows, text.hidden_size)?;
+        let mut timer = Timer::new(false, &stream);
+        layers(lt, kernels, weights, ws, text, &counts, &stream, &mut timer)
+    })();
+    if let Err(error) = recorded {
+        graphs.abandon();
+        return Err(error);
     }
-    Ok(answers)
+    graphs.end(rows)
 }
 
 /// Per-stage GPU time of a pass (DECISION_PROFILE=1): a stream sync after every stage, so only for profiling.

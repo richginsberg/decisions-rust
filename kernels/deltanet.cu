@@ -140,6 +140,7 @@ extern "C" __global__ void delta_chunk(const DeltaChunk* __restrict__ chunks, co
     __shared__ float beta[CHUNK];
 
     const DeltaChunk c = chunks[blockIdx.x];
+    if (c.seq_len == 0) return; // a padding entry of a fixed-size chunk table
     const uint32_t h = blockIdx.y, kh = h / 3;
     const uint32_t remaining = c.seq_len - c.chunk_start; // tokens of this chunk inside the sequence
     const uint32_t tok0 = c.seq_start + c.chunk_start;
@@ -282,6 +283,7 @@ extern "C" __global__ void delta_state(const DeltaSeq* __restrict__ seqs, const 
     bf16* kT = vT + STATE_ROWS * TS;             // [128][TS]: (k exp(cum_last - cum))^T
     float* cum = reinterpret_cast<float*>(kT + DK * TS);
     const DeltaSeq s = seqs[blockIdx.x];
+    if (s.chunks == 0) return; // a padding entry of a fixed-size sequence table
     const uint32_t h = blockIdx.y;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int nbase = blockIdx.z * STATE_ROWS;   // first value dim of this block
@@ -399,6 +401,7 @@ extern "C" __global__ void delta_out(const DeltaChunk* __restrict__ chunks, cons
     float* cum = reinterpret_cast<float*>(at + CHUNK * TS);
     const uint32_t chunk = blockIdx.x;
     const DeltaChunk c = chunks[chunk];
+    if (c.seq_len == 0) return; // a padding entry of a fixed-size chunk table
     const uint32_t h = blockIdx.y, kh = h / 3;
     const int nbase = blockIdx.z * OUT_COLS;
     const uint32_t tok0 = c.seq_start + c.chunk_start, remaining = c.seq_len - c.chunk_start;
