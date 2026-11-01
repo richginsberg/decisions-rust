@@ -52,6 +52,69 @@ extern "C" __global__ void head_norm_rotary(const bf16* __restrict__ qg, const b
 //
 // x, y: [N, C] bf16; w: [C, 4] bf16 (conv1d.weight [C, 1, 4]); seq_of: [N] int32 start token of each token's
 // sequence. y[t][c] = silu(sum_j w[c][j] * x[t - 3 + j][c]) with x = 0 before the sequence start. Sums in f32.
+// The same conv reading the FP8 matmul's f32 accumulator [n, c] with its row and column scales (the input is
+// bf16(acc * row_scale * col_scale), as `scale_rows_cols` would have written). One thread per 8 channels of 8
+// consecutive tokens, with the last 4 rows in registers, so each row is read once rather than four times.
+extern "C" __global__ void conv1d_silu_scaled(const float* __restrict__ acc, const float* __restrict__ row_scale,
+                                              const float* __restrict__ col_scale, const bf16* __restrict__ w,
+                                              const int32_t* __restrict__ seq_of, bf16* __restrict__ y, uint32_t n, uint32_t c) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t groups = (n + 7) / 8, cg = c / 8;
+    if (item >= groups * cg) return;
+    const uint32_t tok_begin = (item / cg) * 8, ch = (item % cg) * 8;
+    float wv[4][8], cs[8];
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) wv[j][e] = bf2f(w[(size_t)(ch + e) * 4 + j]);
+    }
+    {
+        const float4 c0 = *reinterpret_cast<const float4*>(col_scale + ch);
+        const float4 c1 = *reinterpret_cast<const float4*>(col_scale + ch + 4);
+        cs[0] = c0.x; cs[1] = c0.y; cs[2] = c0.z; cs[3] = c0.w; cs[4] = c1.x; cs[5] = c1.y; cs[6] = c1.z; cs[7] = c1.w;
+    }
+    // The last four rows in registers; tok_begin is a multiple of 8, so row r lives in ring[r & 3] with the
+    // index known at compile time once the token loop is unrolled.
+    float ring[4][8];
+    auto load_row = [&](int32_t tok, float* r) {
+        if (tok < 0) {
+#pragma unroll
+            for (int e = 0; e < 8; e++) r[e] = 0.f;
+            return;
+        }
+        const float rs = row_scale[tok];
+        const float4 a0 = *reinterpret_cast<const float4*>(acc + (size_t)tok * c + ch);
+        const float4 a1 = *reinterpret_cast<const float4*>(acc + (size_t)tok * c + ch + 4);
+        const float a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+#pragma unroll
+        for (int e = 0; e < 8; e++) r[e] = round_bf16(a[e] * rs * cs[e]);
+    };
+    load_row((int32_t)tok_begin - 3, ring[1]);
+    load_row((int32_t)tok_begin - 2, ring[2]);
+    load_row((int32_t)tok_begin - 1, ring[3]);
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const uint32_t tok = tok_begin + i;
+        if (tok >= n) break;
+        load_row((int32_t)tok, ring[i & 3]);
+        const int32_t start = seq_of[tok];
+        float out[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int32_t src = (int32_t)tok - 3 + j;
+            if (src < start) continue;
+            const float* r = ring[(i + 1 + j) & 3]; // (tok - 3 + j) & 3 with tok_begin a multiple of 4
+#pragma unroll
+            for (int e = 0; e < 8; e++) out[e] += r[e] * wv[j][e];
+        }
+        uint4 packed;
+        bf16* op = reinterpret_cast<bf16*>(&packed);
+#pragma unroll
+        for (int e = 0; e < 8; e++) op[e] = f2bf(silu(round_bf16(out[e])));
+        *reinterpret_cast<uint4*>(y + (size_t)tok * c + ch) = packed;
+    }
+}
+
 extern "C" __global__ void conv1d_silu(const bf16* __restrict__ x, const bf16* __restrict__ w, const int32_t* __restrict__ seq_of,
                                        bf16* __restrict__ y, uint32_t n, uint32_t c) {
     const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;

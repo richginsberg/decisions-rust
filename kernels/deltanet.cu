@@ -454,3 +454,37 @@ extern "C" __global__ void gated_norm(const bf16* __restrict__ o, const bf16* __
     }
     *reinterpret_cast<uint2*>(y + base) = outraw;
 }
+
+// The same gated norm with z read from the FP8 matmul's f32 accumulator [N, 6144] and its row and column
+// scales (z = bf16(acc * row_scale * col_scale)).
+extern "C" __global__ void gated_norm_scaled(const bf16* __restrict__ o, const float* __restrict__ z_acc,
+                                             const float* __restrict__ row_scale, const float* __restrict__ col_scale,
+                                             const bf16* __restrict__ w, bf16* __restrict__ y, uint32_t rows, float eps) {
+    const uint32_t item = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (item >= rows * V_HEADS) return;
+    const int lane = threadIdx.x & 31;
+    const size_t base = (size_t)item * DV + lane * 4;
+    const uint32_t tok = item / V_HEADS, ch = (item % V_HEADS) * DV + lane * 4;
+    const uint2 raw = *reinterpret_cast<const uint2*>(o + base);
+    const uint2 wraw = *reinterpret_cast<const uint2*>(w + lane * 4);
+    const float4 za = *reinterpret_cast<const float4*>(z_acc + base);
+    const float4 cs = *reinterpret_cast<const float4*>(col_scale + ch);
+    const float rs = row_scale[tok];
+    const float zv[4] = {round_bf16(za.x * rs * cs.x), round_bf16(za.y * rs * cs.y), round_bf16(za.z * rs * cs.z), round_bf16(za.w * rs * cs.w)};
+    const bf16* op = reinterpret_cast<const bf16*>(&raw);
+    const bf16* wp = reinterpret_cast<const bf16*>(&wraw);
+    float v[4], ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) { v[i] = bf2f(op[i]); ss += v[i] * v[i]; }
+    ss = warp_sum(ss);
+    const float inv = rsqrtf(ss / (float)DV + eps);
+    uint2 outraw;
+    bf16* outp = reinterpret_cast<bf16*>(&outraw);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float nv = round_bf16(v[i] * inv);
+        const float gv = round_bf16(bf2f(wp[i]) * nv);
+        outp[i] = f2bf(gv * silu(zv[i]));
+    }
+    *reinterpret_cast<uint2*>(y + base) = outraw;
+}

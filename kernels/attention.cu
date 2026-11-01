@@ -1,14 +1,13 @@
 // Non-causal attention over packed sequences, on the tensor cores (bf16 mma.sync, f32 accumulation), with
 // the online softmax of FlashAttention-2.
 //
-// One block = 4 warps = 64 queries of one sequence for one head; each warp owns 16 query rows. Keys and values
-// of the same sequence stream through shared memory 32 at a time; scores never leave registers: the C-fragment
-// layout of S = Q K^T is exactly the A-fragment layout needed for P V, so P is re-packed in place.
+// One block = 8 warps = 128 queries of one sequence for one head; each warp owns 16 query rows. Keys and
+// values of the same sequence stream through a double-buffered shared-memory tile of 32 keys, filled with
+// cp.async while the previous tile is computed. Scores never leave registers: the C-fragment layout of
+// S = Q K^T is exactly the A-fragment layout needed for P V, so P is re-packed in place. K and V stay
+// row-major in shared memory; ldmatrix (and ldmatrix.trans for V) forms the B fragments.
 //
-// Fragment layouts of mma.sync.m16n8k16 (row.col, bf16 -> f32), with g = lane / 4 and t = lane % 4:
-//   A (16x16, row-major): a0 = A[g][2t..2t+1], a1 = A[g+8][2t..], a2 = A[g][2t+8..], a3 = A[g+8][2t+8..]
-//   B (16x8, "col"):      b0 = B[2t..2t+1][g], b1 = B[2t+8..2t+9][g]
-//   C (16x8, f32):        c0,c1 = C[g][2t, 2t+1], c2,c3 = C[g+8][2t, 2t+1]
+// Fragment layouts of mma.sync.m16n8k16 (row.col, bf16 -> f32): see common.cuh.
 //
 // Text: head_dim 256, 24 query heads over 4 key/value heads (GQA), the output gated by sigmoid(gate).
 // Vision: head_dim 72 padded to 80 (zeros beyond 72), 16 heads, no gate.
@@ -18,27 +17,46 @@
 #include "common.cuh"
 
 #define KEYS 32
-#define QUERIES 64
-#define THREADS 128
+#define QUERIES 128
+#define THREADS 256
 
-// A sequence's slice of the pack and which 64-query tile this block handles.
+// A sequence's slice of the pack and which 128-query tile this block handles.
 struct AttnTile {
     uint32_t seq_start; // first token of the sequence in the pack
     uint32_t seq_len;
     uint32_t q_start;   // first query of the tile, relative to seq_start
 };
 
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, int src_bytes) {
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(src_bytes));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+// Two 8x8 b16 matrices whose row addresses lanes 0..15 give: r[i] = matrix i's (lane / 4, 2 (lane % 4)..+1).
+__device__ __forceinline__ void ldmatrix_x2(uint32_t* r, const bf16* p) {
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(s));
+}
+// The same, transposed: r[i] = matrix i's (2 (lane % 4)..+1, lane / 4).
+__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t* r, const bf16* p) {
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(s));
+}
+
 template <int D, int DREAL, bool GATED>
 __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* __restrict__ q, const bf16* __restrict__ k,
                                const bf16* __restrict__ v, const bf16* __restrict__ gate, bf16* __restrict__ out,
                                uint32_t q_stride, uint32_t kv_stride, uint32_t gate_stride, uint32_t gate_head_stride,
                                uint32_t out_stride, uint32_t heads, uint32_t kv_heads, float scale_log2) {
-    constexpr int KSTEPS = D / 16;    // k-steps over the head dim for Q K^T
-    constexpr int NTILES = D / 8;     // n-tiles over the head dim for P V
-    constexpr int KPAD = D + 8;       // smem row stride (elements) of the K tile
-    constexpr int VPAD = KEYS + 8;    // smem row stride of the transposed V tile
-    __shared__ __align__(16) bf16 ks[KEYS * KPAD];
-    __shared__ __align__(16) bf16 vt[D * VPAD];
+    constexpr int KSTEPS = D / 16;      // k-steps over the head dim for Q K^T
+    constexpr int NTILES = D / 8;       // n-tiles over the head dim for P V
+    constexpr int PAD = D + 8;          // smem row stride (elements) of the K and V tiles
+    constexpr int STAGE = 2 * KEYS * PAD; // elements per stage: K tile, then V tile
+    extern __shared__ __align__(16) unsigned char attn_smem[];
+    bf16* smem = reinterpret_cast<bf16*>(attn_smem);
 
     const AttnTile tile = tiles[blockIdx.x];
     const uint32_t head = blockIdx.y;
@@ -48,8 +66,7 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
     // A warp whose 16 rows all lie beyond the sequence still runs the loop (it shares the block's barriers);
     // its rows read row 0 and store nothing.
 
-    // Q fragments for this warp's 16 rows, straight from global memory (rows beyond the sequence read row 0:
-    // their outputs are never stored).
+    // Q fragments for this warp's 16 rows, straight from global memory.
     uint32_t qa[KSTEPS][4];
     {
         const uint32_t r_lo = min(row0 + g, tile.seq_len - 1), r_hi = min(row0 + g + 8, tile.seq_len - 1);
@@ -65,30 +82,43 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
         }
     }
 
+    // Issue the loads of key tile `it` into stage `it & 1` (16 bytes per cp.async; zero-filled beyond the
+    // sequence or the real head dim, reading a valid address with no bytes).
+    auto issue = [&](uint32_t it) {
+        const uint32_t key0 = it * KEYS;
+        bf16* kd = smem + (it & 1) * STAGE;
+        bf16* vd = kd + KEYS * PAD;
+        for (int i = threadIdx.x; i < KEYS * (D / 8); i += THREADS) {
+            const int key = i / (D / 8), d = (i % (D / 8)) * 8;
+            const bool ok = key0 + key < tile.seq_len && d < DREAL;
+            const size_t base = ok ? (size_t)(tile.seq_start + key0 + key) * kv_stride + kv_head * DREAL + d : (size_t)tile.seq_start * kv_stride;
+            cp_async16(kd + key * PAD + d, k + base, ok ? 16 : 0);
+            cp_async16(vd + key * PAD + d, v + base, ok ? 16 : 0);
+        }
+    };
+
     float o[NTILES][4];
 #pragma unroll
     for (int n = 0; n < NTILES; n++) { o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f; }
     float m_lo = -INFINITY, m_hi = -INFINITY, l_lo = 0.f, l_hi = 0.f;
 
-    for (uint32_t key0 = 0; key0 < tile.seq_len; key0 += KEYS) {
-        // Load K [KEYS][D] and V^T [D][KEYS] for keys key0.. (zero beyond the sequence).
-        __syncthreads();
-        for (int i = threadIdx.x; i < KEYS * (D / 8); i += THREADS) {
-            const int key = i / (D / 8), d = (i % (D / 8)) * 8;
-            uint4 kval = make_uint4(0, 0, 0, 0), vval = make_uint4(0, 0, 0, 0);
-            if (key0 + key < tile.seq_len && d < DREAL) {
-                const size_t base = (size_t)(tile.seq_start + key0 + key) * kv_stride + kv_head * DREAL + d;
-                kval = *reinterpret_cast<const uint4*>(k + base);
-                vval = *reinterpret_cast<const uint4*>(v + base);
-            }
-            *reinterpret_cast<uint4*>(ks + key * KPAD + d) = kval;
-            const bf16* vp = reinterpret_cast<const bf16*>(&vval);
-#pragma unroll
-            for (int j = 0; j < 8; j++) vt[(d + j) * VPAD + key] = vp[j];
+    const uint32_t iters = (tile.seq_len + KEYS - 1) / KEYS;
+    issue(0);
+    cp_async_commit();
+    for (uint32_t it = 0; it < iters; it++) {
+        if (it + 1 < iters) {
+            issue(it + 1); // into the stage the previous iteration finished reading (its trailing barrier)
+            cp_async_commit();
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
         }
-        __syncthreads();
+        __syncthreads(); // tile `it` is visible to every warp
+        const bf16* kd = smem + (it & 1) * STAGE;
+        const bf16* vd = kd + KEYS * PAD;
+        const uint32_t key0 = it * KEYS;
 
-        // S = Q K^T for this warp's 16 rows x 32 keys: 4 n-tiles of 8 keys.
+        // S = Q K^T for this warp's 16 rows x 32 keys: 4 n-tiles of 8 keys; K rows as B fragments by ldmatrix.
         float s[KEYS / 8][4];
 #pragma unroll
         for (int n = 0; n < KEYS / 8; n++) { s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.f; }
@@ -97,9 +127,8 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
 #pragma unroll
             for (int n = 0; n < KEYS / 8; n++) {
                 uint32_t b[2];
-                const bf16* kp = ks + (n * 8 + g) * KPAD + st * 16 + 2 * t;
-                b[0] = *reinterpret_cast<const uint32_t*>(kp);
-                b[1] = *reinterpret_cast<const uint32_t*>(kp + 8);
+                // lanes 0..7: rows n*8.. at columns st*16; lanes 8..15: the same rows at columns st*16 + 8
+                ldmatrix_x2(b, kd + (n * 8 + (lane & 7)) * PAD + st * 16 + ((lane >> 3) & 1) * 8);
                 mma_bf16(s[n], qa[st], b);
             }
         }
@@ -147,7 +176,7 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
             o[n][2] *= alpha_hi; o[n][3] *= alpha_hi;
         }
 
-        // O += P V: P as A fragments (2 k-steps of 16 keys), V^T from smem as B fragments.
+        // O += P V: P as A fragments (2 k-steps of 16 keys), V rows as B fragments by ldmatrix.trans.
         uint32_t pa[2][4];
 #pragma unroll
         for (int ks2 = 0; ks2 < 2; ks2++) {
@@ -161,12 +190,12 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
 #pragma unroll
             for (int n = 0; n < NTILES; n++) {
                 uint32_t b[2];
-                const bf16* vp = vt + (n * 8 + g) * VPAD + ks2 * 16 + 2 * t;
-                b[0] = *reinterpret_cast<const uint32_t*>(vp);
-                b[1] = *reinterpret_cast<const uint32_t*>(vp + 8);
+                // lanes 0..15: V rows ks2*16 + lane at columns n*8 (matrix 0 = keys ..+8, matrix 1 = keys +8..+16)
+                ldmatrix_x2_trans(b, vd + (ks2 * 16 + (lane & 15)) * PAD + n * 8);
                 mma_bf16(o[n], pa[ks2], b);
             }
         }
+        __syncthreads(); // everyone is done with this stage before the next iteration refills it
     }
 
     // Normalize, gate, store rows g and g+8 (if inside the sequence).
@@ -198,6 +227,10 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
         }
     }
 }
+
+// Dynamic shared memory of each instantiation: 2 stages x (K + V) x KEYS x (D + 8) bf16.
+#define ATTENTION_SMEM (2 * 2 * KEYS * (256 + 8) * 2)
+#define VISION_ATTENTION_SMEM (2 * 2 * KEYS * (80 + 8) * 2)
 
 // Text attention: q [N, 24, 256] (stride q_stride), k/v [N, 4, 256] (stride kv_stride), gate inside the q_proj
 // output [N, 24, 512] at offset 256 of each head (pass gate = q_proj output + 256, gate_stride 12288,

@@ -21,8 +21,11 @@ const DELTA_CHUNK_SMEM: u32 = (2 * 64 * 136 * 2 + 64 * 64 * 4) as u32;
 const DELTA_STATE_SMEM: u32 = (64 * 136 * 2 + 2 * 128 * 72 * 2 + 64 * 4) as u32;
 const DELTA_OUT_SMEM: u32 = (128 * 136 * 2 + 128 * 72 * 2 + 64 * 136 * 2 + 64 * 72 * 2 + 64 * 4) as u32;
 
-/// Queries per attention block (attention.cu's QUERIES).
-pub const ATTENTION_QUERIES: usize = 64;
+/// Queries per attention block (attention.cu's QUERIES) and the kernels' dynamic shared memory
+/// (ATTENTION_SMEM / VISION_ATTENTION_SMEM: 2 stages x K and V x 32 keys x (D + 8) bf16).
+pub const ATTENTION_QUERIES: usize = 128;
+const ATTENTION_SMEM: u32 = (2 * 2 * 32 * (256 + 8) * 2) as u32;
+const VISION_ATTENTION_SMEM: u32 = (2 * 2 * 32 * (80 + 8) * 2) as u32;
 
 pub struct Kernels {
     _module: Arc<CudaModule>,
@@ -40,6 +43,9 @@ pub struct Kernels {
     vision_attention: CudaFunction,
     head_norm_rotary: CudaFunction,
     conv1d_silu: CudaFunction,
+    conv1d_silu_scaled: CudaFunction,
+    gated_norm_scaled: CudaFunction,
+    rms_norm_fp4_scaled: CudaFunction,
     delta_chunk: CudaFunction,
     delta_state: CudaFunction,
     delta_out: CudaFunction,
@@ -80,6 +86,10 @@ impl Kernels {
         let delta_chunk = f("delta_chunk")?;
         let delta_state = f("delta_state")?;
         let delta_out = f("delta_out")?;
+        let attention = f("attention")?;
+        let vision_attention = f("vision_attention")?;
+        attention.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, ATTENTION_SMEM as i32)?;
+        vision_attention.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, VISION_ATTENTION_SMEM as i32)?;
         delta_chunk.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DELTA_CHUNK_SMEM as i32)?;
         delta_state.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DELTA_STATE_SMEM as i32)?;
         delta_out.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DELTA_OUT_SMEM as i32)?;
@@ -93,10 +103,13 @@ impl Kernels {
             silu_mul_fp4: f("silu_mul_fp4")?,
             add_inplace: f("add_inplace")?,
             scale_rows_cols: f("scale_rows_cols")?,
-            attention: f("attention")?,
-            vision_attention: f("vision_attention")?,
+            attention,
+            vision_attention,
             head_norm_rotary: f("head_norm_rotary")?,
             conv1d_silu: f("conv1d_silu")?,
+            conv1d_silu_scaled: f("conv1d_silu_scaled")?,
+            gated_norm_scaled: f("gated_norm_scaled")?,
+            rms_norm_fp4_scaled: f("rms_norm_fp4_scaled")?,
             delta_chunk,
             delta_state,
             delta_out,
@@ -179,6 +192,17 @@ impl Kernels {
         self.zero_scale_padding(scales, rows, n)
     }
 
+    /// rms_norm_fp4 over an FP8 matmul's f32 accumulator [rows, n] with its row and column scales.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_fp4_scaled(&self, acc: &CudaSlice<f32>, row_scale: &CudaSlice<f32>, col_scale: &CudaSlice<f32>, residual: Option<&mut CudaSlice<u16>>, w: &CudaSlice<u16>, packed: &mut CudaSlice<u8>, scales: &mut CudaSlice<u8>, rows: usize, n: usize, eps: f32, encode: f32) -> Result<(), CudaError> {
+        let residual = self.opt(residual);
+        let n32 = n as u32;
+        unsafe {
+            self.stream.launch_builder(&self.rms_norm_fp4_scaled).arg(acc).arg(row_scale).arg(col_scale).arg(&residual).arg(w).arg(&mut *packed).arg(&mut *scales).arg(&n32).arg(&eps).arg(&encode).launch(Self::rows(rows))?;
+        }
+        self.zero_scale_padding(scales, rows, n)
+    }
+
     /// rms_norm(x (+ residual)) quantized to FP8 with one scale per row.
     #[allow(clippy::too_many_arguments)]
     pub fn rms_norm_fp8(&self, x: &CudaSlice<u16>, residual: Option<&mut CudaSlice<u16>>, w: &CudaSlice<u16>, values: &mut CudaSlice<u8>, row_scale: &mut CudaSlice<f32>, rows: usize, n: usize, eps: f32) -> Result<(), CudaError> {
@@ -234,7 +258,7 @@ impl Kernels {
         let (q_stride, kv_stride, gate_stride, gate_head_stride, out_stride) = ((heads * 256) as u32, (kv_heads * 256) as u32, (heads * 512) as u32, 512u32, (heads * 256) as u32);
         let (heads32, kv32) = (heads as u32, kv_heads as u32);
         let scale_log2 = scale * std::f32::consts::LOG2_E;
-        let cfg = LaunchConfig { grid_dim: (n_tiles as u32, heads32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig { grid_dim: (n_tiles as u32, heads32, 1), block_dim: (256, 1, 1), shared_mem_bytes: ATTENTION_SMEM };
         unsafe {
             self.stream
                 .launch_builder(&self.attention)
@@ -255,7 +279,7 @@ impl Kernels {
         let q = self.ptr(qkv);
         let k = Ptr::of(qkv, heads * 72, &self.stream);
         let v = Ptr::of(qkv, 2 * heads * 72, &self.stream);
-        let cfg = LaunchConfig { grid_dim: (n_tiles as u32, heads32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig { grid_dim: (n_tiles as u32, heads32, 1), block_dim: (256, 1, 1), shared_mem_bytes: VISION_ATTENTION_SMEM };
         unsafe {
             self.stream.launch_builder(&self.vision_attention).arg(tiles).arg(&q).arg(&k).arg(&v).arg(out).arg(&stride).arg(&out_stride).arg(&heads32).arg(&scale_log2).launch(cfg)?;
         }
@@ -270,6 +294,18 @@ impl Kernels {
         let (heads32, kv32, rot32) = (heads as u32, kv_heads as u32, rot as u32);
         unsafe {
             self.stream.launch_builder(&self.head_norm_rotary).arg(qg).arg(kin).arg(qw).arg(kw).arg(positions).arg(q).arg(k).arg(&heads32).arg(&kv32).arg(&rot32).arg(&theta).arg(&eps).launch(Self::rows(rows))?;
+        }
+        Ok(())
+    }
+
+    /// The causal conv + SiLU over an FP8 matmul's f32 accumulator [N, c] with its row and column scales.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_silu_scaled(&self, acc: &CudaSlice<f32>, row_scale: &CudaSlice<f32>, col_scale: &CudaSlice<f32>, w: &CudaSlice<u16>, seq_of: &CudaSlice<i32>, y: &mut CudaSlice<u16>, rows: usize, c: usize) -> Result<(), CudaError> {
+        let (n32, c32) = (rows as u32, c as u32);
+        let items = rows.div_ceil(8) * (c / 8);
+        let cfg = LaunchConfig { grid_dim: (items.div_ceil(256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            self.stream.launch_builder(&self.conv1d_silu_scaled).arg(acc).arg(row_scale).arg(col_scale).arg(w).arg(seq_of).arg(y).arg(&n32).arg(&c32).launch(cfg)?;
         }
         Ok(())
     }
@@ -316,6 +352,18 @@ impl Kernels {
     }
 
     /// The gated RMSNorm after the delta rule: o [N, 48, 128], z [N, 6144], w [128] -> y [N, 6144].
+    /// The gated norm with z read from its FP8 matmul's f32 accumulator [rows, 6144] and scales.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_norm_scaled(&self, o: &CudaSlice<u16>, z_acc: &CudaSlice<f32>, row_scale: &CudaSlice<f32>, col_scale: &CudaSlice<f32>, w: &CudaSlice<u16>, y: &mut CudaSlice<u16>, rows: usize, eps: f32) -> Result<(), CudaError> {
+        let rows32 = rows as u32;
+        let items = rows * 48;
+        let cfg = LaunchConfig { grid_dim: ((items * 32).div_ceil(256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            self.stream.launch_builder(&self.gated_norm_scaled).arg(o).arg(z_acc).arg(row_scale).arg(col_scale).arg(w).arg(y).arg(&rows32).arg(&eps).launch(cfg)?;
+        }
+        Ok(())
+    }
+
     pub fn gated_norm(&self, o: &CudaSlice<u16>, z: &CudaSlice<u16>, w: &CudaSlice<u16>, y: &mut CudaSlice<u16>, rows: usize, eps: f32) -> Result<(), CudaError> {
         let rows32 = rows as u32;
         let items = rows * 48;

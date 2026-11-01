@@ -189,17 +189,15 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
                 timer.tick("norm");
                 kernels.quantize_fp8(&ws.normed, &mut ws.fp8_values, &mut ws.fp8_scales, n, hidden)?;
                 timer.tick("quant8");
+                // The qkv and z projections stay as f32 accumulators; their consumers (the conv, the gated norm)
+                // apply the row and column scales as they read.
                 lt.fp8(&ws.fp8_values, &lin.qkv, &mut ws.fp8_acc, n)?;
                 timer.tick("fp8mm");
-                kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.qkv.scale, &mut ws.wide, n, qkv_dim)?;
-                timer.tick("rescale");
-                lt.fp8(&ws.fp8_values, &lin.z, &mut ws.fp8_acc, n)?;
+                lt.fp8(&ws.fp8_values, &lin.z, &mut ws.z_acc, n)?;
                 timer.tick("fp8mm");
-                kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.z.scale, &mut ws.z, n, v_dim)?;
-                timer.tick("rescale");
                 lt.bf16_padded(&ws.normed, &lin.ab, &mut ws.ab, n)?;
                 timer.tick("bf16mm");
-                kernels.conv1d_silu(&ws.wide, &lin.conv, &seq_of, &mut ws.mid, n, qkv_dim)?;
+                kernels.conv1d_silu_scaled(&ws.fp8_acc, &ws.fp8_scales, &lin.qkv.scale, &lin.conv, &seq_of, &mut ws.mid, n, qkv_dim)?;
                 timer.tick("conv");
                 kernels.delta_chunk(&delta_chunks, n_chunks, &ws.mid, &ws.ab, &lin.a_log_exp, &lin.dt_bias, &mut ws.delta_u, &mut ws.delta_w, &mut ws.delta_intra, &mut ws.cum_decay)?;
                 timer.tick("delta.chunk");
@@ -209,14 +207,13 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
                 timer.tick("delta.out");
                 // mixed holds the delta-rule output [N, 48, 128]; the gated norm writes out_proj's input (into
                 // `wide`, whose qkv the conv has consumed).
-                kernels.gated_norm(&ws.mixed, &ws.z, &lin.norm, &mut ws.wide, n, eps)?;
+                kernels.gated_norm_scaled(&ws.mixed, &ws.z_acc, &ws.fp8_scales, &lin.z.scale, &lin.norm, &mut ws.wide, n, eps)?;
                 timer.tick("gnorm");
                 kernels.quantize_fp8(&ws.wide, &mut ws.fp8_values, &mut ws.fp8_scales, n, v_dim)?;
                 timer.tick("quant8");
+                // out_proj's accumulator is consumed by the post-norm below.
                 lt.fp8(&ws.fp8_values, &lin.out, &mut ws.fp8_acc, n)?;
                 timer.tick("fp8mm");
-                kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.out.scale, &mut ws.out, n, hidden)?;
-                timer.tick("rescale");
             }
             Mixer::Full(full) => {
                 let heads = text.num_attention_heads;
@@ -246,7 +243,10 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
             }
         }
         // h += out; x = rms_norm(h) -> fp4; gate|up; silu * up -> fp4; down; h += mlp.
-        kernels.rms_norm_fp4(&ws.out, Some(&mut ws.h), &layer.post_norm, &mut ws.fp4_packed, &mut ws.fp4_scales, n, hidden, eps, layer.gate_up.input_encode)?;
+        match &layer.mixer {
+            Mixer::Linear(lin) => kernels.rms_norm_fp4_scaled(&ws.fp8_acc, &ws.fp8_scales, &lin.out.scale, Some(&mut ws.h), &layer.post_norm, &mut ws.fp4_packed, &mut ws.fp4_scales, n, hidden, eps, layer.gate_up.input_encode)?,
+            Mixer::Full(_) => kernels.rms_norm_fp4(&ws.out, Some(&mut ws.h), &layer.post_norm, &mut ws.fp4_packed, &mut ws.fp4_scales, n, hidden, eps, layer.gate_up.input_encode)?,
+        }
         timer.tick("norm");
         lt.fp4(&ws.fp4_packed, &ws.fp4_scales, &layer.gate_up, &mut ws.wide, n)?;
         timer.tick("fp4mm");

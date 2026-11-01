@@ -99,7 +99,32 @@ extern "C" __global__ void fp4_zero_scale_padding(uint8_t* __restrict__ scales, 
 // With `residual`, the input is first replaced by residual + x, rounded to bf16 and written to `residual`
 // (the fused add_rms_norm: the residual stream stays bf16-rounded as in eager PyTorch).
 // One block per row; `n` <= 32768 and a multiple of 16; blockDim 256.
-__device__ __forceinline__ void rms_norm_row(const bf16* __restrict__ x, bf16* __restrict__ residual,
+// Loaders of one 16-value block of the norm's input: a bf16 row, or an FP8 matmul's f32 accumulator row with
+// its row and column scales (bf16(acc * row_scale * col_scale), as `scale_rows_cols` would have written).
+struct LoadBf16 {
+    const bf16* x;
+    __device__ __forceinline__ void operator()(uint32_t blk, float* v) const { load16(x + blk * 16, v); }
+};
+struct LoadScaled {
+    const float* acc;
+    const float* col_scale;
+    float rs;
+    __device__ __forceinline__ void operator()(uint32_t blk, float* v) const {
+        const float4* a = reinterpret_cast<const float4*>(acc + blk * 16);
+        const float4* c = reinterpret_cast<const float4*>(col_scale + blk * 16);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float4 av = a[i], cv = c[i];
+            v[i * 4] = round_bf16(av.x * rs * cv.x);
+            v[i * 4 + 1] = round_bf16(av.y * rs * cv.y);
+            v[i * 4 + 2] = round_bf16(av.z * rs * cv.z);
+            v[i * 4 + 3] = round_bf16(av.w * rs * cv.w);
+        }
+    }
+};
+
+template <class Load>
+__device__ __forceinline__ void rms_norm_row(const Load& load, bf16* __restrict__ residual,
                                              const bf16* __restrict__ w, float eps, uint32_t n, float* out_values,
                                              uint32_t* out_blocks, float* scratch, uint32_t max_blocks) {
     const uint32_t blocks = n / 16;
@@ -107,7 +132,7 @@ __device__ __forceinline__ void rms_norm_row(const bf16* __restrict__ x, bf16* _
     uint32_t count = 0;
     for (uint32_t blk = threadIdx.x; blk < blocks && count < max_blocks; blk += blockDim.x, count++) {
         float* v = out_values + count * 16;
-        load16(x + blk * 16, v);
+        load(blk, v);
         if (residual) {
             float r[16];
             load16(residual + blk * 16, r);
@@ -140,7 +165,7 @@ extern "C" __global__ void rms_norm(const bf16* __restrict__ x, bf16* __restrict
     const size_t row = blockIdx.x;
     float values[NORM_MAX_BLOCKS * 16];
     uint32_t blocks[NORM_MAX_BLOCKS];
-    rms_norm_row(x + row * n, residual ? residual + row * n : nullptr, w, eps, n, values, blocks, scratch, NORM_MAX_BLOCKS);
+    rms_norm_row(LoadBf16{x + row * n}, residual ? residual + row * n : nullptr, w, eps, n, values, blocks, scratch, NORM_MAX_BLOCKS);
     const uint32_t count = threadIdx.x < n / 16 ? min((n / 16 - threadIdx.x + blockDim.x - 1) / blockDim.x, (uint32_t)NORM_MAX_BLOCKS) : 0u;
     for (uint32_t c = 0; c < count; c++) store16(y + row * n + blocks[c] * 16, values + c * 16);
 }
@@ -153,7 +178,23 @@ extern "C" __global__ void rms_norm_fp4(const bf16* __restrict__ x, bf16* __rest
     const size_t row = blockIdx.x;
     float values[NORM_MAX_BLOCKS * 16];
     uint32_t blocks[NORM_MAX_BLOCKS];
-    rms_norm_row(x + row * n, residual ? residual + row * n : nullptr, w, eps, n, values, blocks, scratch, NORM_MAX_BLOCKS);
+    rms_norm_row(LoadBf16{x + row * n}, residual ? residual + row * n : nullptr, w, eps, n, values, blocks, scratch, NORM_MAX_BLOCKS);
+    const uint32_t count = threadIdx.x < n / 16 ? min((n / 16 - threadIdx.x + blockDim.x - 1) / blockDim.x, (uint32_t)NORM_MAX_BLOCKS) : 0u;
+    const uint32_t col_blocks = (n / 16 + 3) / 4;
+    for (uint32_t c = 0; c < count; c++) quantize_block16(values + c * 16, encode, row, blocks[c], col_blocks, packed, scales, n);
+}
+
+// rms_norm_fp4 over an FP8 matmul's f32 accumulator with its row and column scales (the out_proj of the
+// linear-attention layers), with the residual add.
+extern "C" __global__ void rms_norm_fp4_scaled(const float* __restrict__ acc, const float* __restrict__ row_scale,
+                                               const float* __restrict__ col_scale, bf16* __restrict__ residual,
+                                               const bf16* __restrict__ w, uint8_t* __restrict__ packed,
+                                               uint8_t* __restrict__ scales, uint32_t n, float eps, float encode) {
+    __shared__ float scratch[32];
+    const size_t row = blockIdx.x;
+    float values[NORM_MAX_BLOCKS * 16];
+    uint32_t blocks[NORM_MAX_BLOCKS];
+    rms_norm_row(LoadScaled{acc + row * n, col_scale, row_scale[row]}, residual ? residual + row * n : nullptr, w, eps, n, values, blocks, scratch, NORM_MAX_BLOCKS);
     const uint32_t count = threadIdx.x < n / 16 ? min((n / 16 - threadIdx.x + blockDim.x - 1) / blockDim.x, (uint32_t)NORM_MAX_BLOCKS) : 0u;
     const uint32_t col_blocks = (n / 16 + 3) / 4;
     for (uint32_t c = 0; c < count; c++) quantize_block16(values + c * 16, encode, row, blocks[c], col_blocks, packed, scales, n);
@@ -166,7 +207,7 @@ extern "C" __global__ void rms_norm_fp8(const bf16* __restrict__ x, bf16* __rest
     const size_t row = blockIdx.x;
     float values[NORM_MAX_BLOCKS * 16];
     uint32_t blocks[NORM_MAX_BLOCKS];
-    rms_norm_row(x + row * n, residual ? residual + row * n : nullptr, w, eps, n, values, blocks, scratch, NORM_MAX_BLOCKS);
+    rms_norm_row(LoadBf16{x + row * n}, residual ? residual + row * n : nullptr, w, eps, n, values, blocks, scratch, NORM_MAX_BLOCKS);
     const uint32_t count = threadIdx.x < n / 16 ? min((n / 16 - threadIdx.x + blockDim.x - 1) / blockDim.x, (uint32_t)NORM_MAX_BLOCKS) : 0u;
     float amax = 0.f;
     for (uint32_t c = 0; c < count; c++)
