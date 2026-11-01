@@ -65,6 +65,11 @@ impl Weights {
             let handle = std::fs::File::open(&path).map_err(|source| WeightsError::Read { path: path.clone(), source })?;
             // Safety: the files are the checkpoint's, which nothing writes while the server runs.
             let map = unsafe { Mmap::map(&handle) }.map_err(|source| WeightsError::Read { path: path.clone(), source })?;
+            // The loader walks tensors in layer order, which jumps around the file; from a cold volume that is
+            // many small random reads. Ask for sequential readahead of the whole shard, so the kernel streams
+            // it at the volume's full bandwidth while the first layers load (a hint only; harmless when warm).
+            let _ = map.advise(memmap2::Advice::Sequential);
+            let _ = map.advise(memmap2::Advice::WillNeed);
             let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(map.as_ptr(), map.len()) };
             let tensors = SafeTensors::deserialize(bytes).map_err(|source| WeightsError::SafeTensors { path: path.clone(), source })?;
             for name in tensors.names() {

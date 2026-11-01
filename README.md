@@ -110,11 +110,13 @@ checkpoint: a 3,400-token pass 266 ms vs about 540; 1,000 tokens 79 vs 143; 150 
 medium requests about 2x. 315 of 316 labeled decisions agree (the one is a 0.50 vs 0.52 coin flip), accuracy
 96.2% vs 96.5%. Done: cuBLASLt plans cached per row bucket and their algorithms tuned at load; the delta rule on
 the tensor cores in fla's three-kernel structure (it was 73% of a long pass on CUDA cores); attention with
-cp.async double buffering and ldmatrix; the FP8 rescale fused into its consumers; warm-up passes at load.
-Startup is about 80 s from a warm volume (weights 43 s, warm-up and tuning 32 s). Where a long pass goes now:
+cp.async double buffering and ldmatrix; the FP8 rescale fused into its consumers; warm-up passes at load;
+CUDA graphs of the text layers per bucket.
+Short passes 22 ms at 135 tokens with the layers replayed as a CUDA graph. Startup is about 80 s from a warm
+volume (weights 43 s, warm-up, tuning and graph capture 32 s); a cold volume adds about a minute. Where a long
+pass goes now:
 NVFP4 matmuls 37%, FP8 matmuls 22%, both near the GPU's peak; the delta rule 15%; attention 10%; elementwise
-kernels 16%. Not done: CUDA graphs (short requests are launch-bound at about 30 ms); the last layer computing
-every token rather than only the marker rows.
+kernels 16%. Not done: the last layer computing every token rather than only the marker rows (about 1%).
 
 ## Environment
 
