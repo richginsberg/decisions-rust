@@ -12,7 +12,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use parking_lot::Mutex;
 
-use super::blas::{Bf16Weight, Fp4Weight, Fp8Weight, Lt, swizzled_scale_bytes, swizzled_scale_index};
+use super::blas::{ROW_BUCKET, Bf16Weight, Fp4Weight, Fp8Weight, Lt, swizzled_scale_bytes, swizzled_scale_index};
 use super::kernels::Kernels;
 use super::{CudaError, forward};
 use crate::config::Checkpoint;
@@ -463,8 +463,8 @@ impl GpuModel {
         };
         let weights_on_device = DeviceWeights { embeddings, layers, final_norm, readout, vision };
 
-        // A multiple of 16: the narrow-type matmuls round their row count up to one.
-        let max_tokens = budget.max_tokens.max(64).div_ceil(16) * 16;
+        // A multiple of the row bucket: the activation matmuls round their row count up to one.
+        let max_tokens = budget.max_tokens.max(ROW_BUCKET).div_ceil(ROW_BUCKET) * ROW_BUCKET;
         let workspace = Workspace::allocate(&stream, &checkpoint, max_tokens, !low_memory)?;
         let (free_after, _) = ctx.mem_get_info()?;
         tracing::info!("Weights and workspace on the device; {:.1} GiB free", free_after as f64 / (1u64 << 30) as f64);
@@ -475,11 +475,12 @@ impl GpuModel {
         let mut engine = Engine { stream, lt, kernels, weights: weights_on_device, workspace, profile, last_profile: None };
 
         // Warm up: CUDA loads each kernel on its first launch and cuBLASLt its own on the first call of each
-        // shape, which made the first request after a start take about 2 s. Passes at a few lengths cover the
-        // kernels and the common algorithm choices.
+        // row bucket (the first request after a start took about 2 s, and the first of each new length 50 to
+        // 130 ms). One pass per bucket up to 2048 tokens; longer requests pay once.
         let warm_started = std::time::Instant::now();
-        for length in [64usize, 512, 2048] {
-            let length = length.min(max_tokens);
+        let mut passes = 0;
+        for length in (ROW_BUCKET..=2048.min(max_tokens)).step_by(ROW_BUCKET) {
+            passes += 1;
             let row = Encoded {
                 keys: vec!["warm".into()],
                 counts: vec![2],
@@ -491,7 +492,7 @@ impl GpuModel {
             forward::run(&mut engine, &checkpoint, &[&row])?;
         }
         engine.last_profile = None;
-        tracing::info!("Warm-up passes done in {:.0} ms", warm_started.elapsed().as_secs_f64() * 1000.0);
+        tracing::info!("{passes} warm-up passes in {:.0} ms", warm_started.elapsed().as_secs_f64() * 1000.0);
         Ok(Self { checkpoint, low_memory, encoder, budget, max_length, engine: Mutex::new(engine), last_profile: Mutex::new(None) })
     }
 }
@@ -507,6 +508,7 @@ impl Workspace {
         let heads = text.linear_num_value_heads;
         let max_chunks = n.div_ceil(super::kernels::DELTA_CHUNK) + 64;
         let max_patches = if vision { MAX_IMAGES * (checkpoint.image_processor.size.longest_edge as usize / (vc.patch_size * vc.patch_size)) } else { 64 };
+        let max_patches = max_patches.div_ceil(ROW_BUCKET) * ROW_BUCKET;
         let vh = vc.hidden_size;
         let patch_len = vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size;
         let merged = vh * vc.spatial_merge_size * vc.spatial_merge_size;

@@ -197,7 +197,7 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
                 timer.tick("fp8mm");
                 kernels.scale_rows_cols(&ws.fp8_acc, &ws.fp8_scales, &lin.z.scale, &mut ws.z, n, v_dim)?;
                 timer.tick("rescale");
-                lt.bf16(&ws.normed, &lin.ab, &mut ws.ab, n)?;
+                lt.bf16_padded(&ws.normed, &lin.ab, &mut ws.ab, n)?;
                 timer.tick("bf16mm");
                 kernels.conv1d_silu(&ws.wide, &lin.conv, &seq_of, &mut ws.mid, n, qkv_dim)?;
                 timer.tick("conv");

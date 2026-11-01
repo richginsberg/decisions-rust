@@ -26,6 +26,12 @@ use parking_lot::Mutex;
 
 use super::CudaError;
 
+/// Rows of the activation matmuls are rounded up to a multiple of this: each distinct row count is a new plan
+/// (heuristic query and kernel load, tens of milliseconds for a pass's worth), so a request's row count is
+/// bucketed and the buckets are warmed at startup. Workspace buffers hold a multiple of this many rows, and
+/// the rows beyond the real ones hold stale values whose outputs nothing reads.
+pub const ROW_BUCKET: usize = 64;
+
 /// The cuBLASLt workspace, in bytes: cuBLASLt's own recommendation for Blackwell.
 pub const WORKSPACE_BYTES: usize = 32 << 20;
 
@@ -289,9 +295,7 @@ impl Lt {
         m: usize,
     ) -> Result<(), CudaError> {
         let (n, k) = (w.n, w.k);
-        // Blackwell's block-scaled kernels take M in multiples of 16; the workspace rows are a multiple of 16, and
-        // the rows beyond the real ones hold stale values whose outputs nothing reads.
-        let m = m.div_ceil(16) * 16;
+        let m = m.div_ceil(ROW_BUCKET) * ROW_BUCKET;
         debug_assert!(x_packed.len() >= m * k / 2 && out.len() >= m * n);
         unsafe {
             let mode = sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
@@ -328,7 +332,7 @@ impl Lt {
         m: usize,
     ) -> Result<(), CudaError> {
         let (n, k) = (w.n, w.k);
-        let m = m.div_ceil(16) * 16;
+        let m = m.div_ceil(ROW_BUCKET) * ROW_BUCKET;
         debug_assert!(x_values.len() >= m * k && acc.len() >= m * n);
         unsafe {
             let (w_ptr, _r3) = w.values.device_ptr(&self.stream);
@@ -348,7 +352,13 @@ impl Lt {
         }
     }
 
-    /// `out[M, N] bf16 = x[M, K] bf16 · w^T (+ bias)`.
+    /// `out[M, N] bf16 = x[M, K] bf16 · w^T (+ bias)` with M rounded up to the row bucket: for workspace buffers,
+    /// whose rows are a multiple of it.
+    pub fn bf16_padded(&self, x: &CudaSlice<u16>, w: &Bf16Weight, out: &mut CudaSlice<u16>, m: usize) -> Result<(), CudaError> {
+        self.bf16(x, w, out, m.div_ceil(ROW_BUCKET) * ROW_BUCKET)
+    }
+
+    /// `out[M, N] bf16 = x[M, K] bf16 · w^T (+ bias)` with exactly M rows.
     pub fn bf16(&self, x: &CudaSlice<u16>, w: &Bf16Weight, out: &mut CudaSlice<u16>, m: usize) -> Result<(), CudaError> {
         let (n, k) = (w.n, w.k);
         debug_assert!(x.len() >= m * k && out.len() >= m * n);

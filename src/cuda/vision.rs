@@ -85,22 +85,22 @@ pub fn run(stream: &Arc<CudaStream>, lt: &Lt, kernels: &Kernels, vision: &Vision
     let theta = cfg_rope_theta(checkpoint);
 
     // Patch embedding + position embedding.
-    lt.bf16(&ws.vpixels, &vision.patch_embed, &mut ws.vx, n)?;
+    lt.bf16_padded(&ws.vpixels, &vision.patch_embed, &mut ws.vx, n)?;
     kernels.vision_pos_embed(&mut ws.vx, &vision.pos_embed, &taps, &weights, n, vh)?;
 
     // The blocks.
     let scale = 1.0 / (head_dim as f32).sqrt();
     for block in &vision.blocks {
         kernels.layer_norm(&ws.vx, &block.norm1.0, &block.norm1.1, &mut ws.vnormed, n, vh, eps)?;
-        lt.bf16(&ws.vnormed, &block.qkv, &mut ws.vqkv, n)?;
+        lt.bf16_padded(&ws.vnormed, &block.qkv, &mut ws.vqkv, n)?;
         kernels.vision_rotary(&mut ws.vqkv, &positions, n, heads, theta)?;
         kernels.vision_attention(&tiles, n_tiles, &ws.vqkv, &mut ws.vattn, heads, scale)?;
-        lt.bf16(&ws.vattn, &block.proj, &mut ws.vout, n)?;
+        lt.bf16_padded(&ws.vattn, &block.proj, &mut ws.vout, n)?;
         kernels.add_inplace(&mut ws.vx, &ws.vout, n * vh)?;
         kernels.layer_norm(&ws.vx, &block.norm2.0, &block.norm2.1, &mut ws.vnormed, n, vh, eps)?;
-        lt.bf16(&ws.vnormed, &block.fc1, &mut ws.vmlp, n)?;
+        lt.bf16_padded(&ws.vnormed, &block.fc1, &mut ws.vmlp, n)?;
         kernels.gelu(&mut ws.vmlp, n * block.fc1.n, true)?;
-        lt.bf16(&ws.vmlp, &block.fc2, &mut ws.vout, n)?;
+        lt.bf16_padded(&ws.vmlp, &block.fc2, &mut ws.vout, n)?;
         kernels.add_inplace(&mut ws.vx, &ws.vout, n * vh)?;
     }
 
