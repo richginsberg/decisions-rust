@@ -379,7 +379,7 @@ impl GpuModel {
         let (free, total) = ctx.mem_get_info()?;
         tracing::info!("GPU 0: {:.1} GiB free of {:.1} GiB", free as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
         let kernels = Kernels::load(stream.clone())?;
-        let lt = Lt::new(stream.clone())?;
+        let lt = Lt::new(stream.clone(), Some(&path.join(".decision-tuning")))?;
         let loader = Loader { stream: &stream, weights: &weights };
 
         // Memory: the text layers roughly as they will sit on the device (FP4 as stored, FP8 at one byte per bf16
@@ -515,6 +515,7 @@ impl GpuModel {
             forward::run(&mut engine, &checkpoint, &[&row])?;
         }
         engine.lt.set_tuning(false);
+        engine.lt.save_tuning();
         engine.last_profile = None;
         // A graph of the text layers per warmed bucket: replayed in one call instead of about 700 launches.
         let use_graphs = std::env::var("DECISION_GRAPHS").map_or(true, |v| v != "0") && !low_memory && !profile;

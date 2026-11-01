@@ -15,9 +15,11 @@
 //! algorithm after the first time: a pass makes a few hundred calls, and the heuristic query alone is tens of
 //! microseconds each, which is most of a short pass.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cudarc::cublaslt::result as lt;
 use cudarc::cublaslt::sys;
@@ -77,7 +79,18 @@ pub struct Lt {
     /// default on), but only while `tuning` is set: during the warm-up passes at load. A shape first seen on a
     /// live request takes the heuristic's first choice, since timing 8 candidates costs over a second.
     autotune: bool,
-    tuning: std::sync::atomic::AtomicBool,
+    tuning: AtomicBool,
+    /// Tuned algorithms by shape, persisted on the volume (per GPU and cuBLASLt version) so a restart skips
+    /// the timing: `tuned` holds what was loaded plus what this run timed, `tuned_dirty` whether to save.
+    tuned: Mutex<HashMap<String, [u64; 8]>>,
+    tuned_dirty: AtomicBool,
+    tuning_file: Option<PathBuf>,
+}
+
+/// The shape of a matmul as a cache key: types, dimensions, whether block-scaled and whether biased (the
+/// pointers themselves differ between runs).
+fn shape_key(a_type: i32, out_type: i32, m: usize, n: usize, k: usize, scaled: bool, bias: bool) -> String {
+    format!("{a_type}:{out_type}:{m}x{n}x{k}:{}{}", scaled as u8, bias as u8)
 }
 
 /// Heuristic candidates considered per shape, and the row count from which timing them is worth it (below
@@ -180,20 +193,77 @@ unsafe fn set_desc<T>(desc: &Desc, attr: sys::cublasLtMatmulDescAttributes_t, va
 }
 
 impl Lt {
-    pub fn new(stream: Arc<CudaStream>) -> Result<Self, CudaError> {
+    /// `tuning_dir`: where tuned algorithms are kept between runs (DECISION_TUNING_CACHE overrides it; an
+    /// empty value disables the file).
+    pub fn new(stream: Arc<CudaStream>, tuning_dir: Option<&Path>) -> Result<Self, CudaError> {
         let handle = lt::create_handle().map_err(|e| CudaError::Blas(format!("cublasLtCreate: {e:?}")))?;
+        let tuning_dir = match std::env::var("DECISION_TUNING_CACHE") {
+            Ok(v) if v.is_empty() => None,
+            Ok(v) => Some(PathBuf::from(v)),
+            Err(_) => tuning_dir.map(Path::to_path_buf),
+        };
+        let tuning_file = match tuning_dir {
+            Some(dir) => {
+                let device = stream.context().name().unwrap_or_else(|_| "gpu".into());
+                let device: String = device.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+                let version = unsafe { sys::cublasLtGetVersion() };
+                Some(dir.join(format!("cublaslt-tuning-{device}-v{version}.json")))
+            }
+            None => None,
+        };
+        let mut tuned = HashMap::new();
+        if let Some(file) = &tuning_file
+            && let Ok(text) = std::fs::read_to_string(file)
+        {
+            match serde_json::from_str::<BTreeMap<String, Vec<u64>>>(&text) {
+                Ok(saved) => {
+                    tuned.extend(saved.into_iter().filter_map(|(key, data)| <[u64; 8]>::try_from(data).ok().map(|d| (key, d))));
+                    tracing::info!("{} tuned cuBLASLt algorithms from {}", tuned.len(), file.display());
+                }
+                Err(error) => tracing::warn!("ignoring {}: {error}", file.display()),
+            }
+        }
         let workspace = stream.alloc_zeros::<u8>(WORKSPACE_BYTES)?;
         let workspace_ptr = {
             let (ptr, _record) = workspace.device_ptr(&stream);
             ptr as *mut c_void
         };
         let autotune = std::env::var("DECISION_AUTOTUNE").map_or(true, |v| v != "0");
-        Ok(Self { handle, _workspace: workspace, workspace_ptr, stream, plans: Mutex::new(HashMap::new()), autotune, tuning: std::sync::atomic::AtomicBool::new(false) })
+        Ok(Self {
+            handle,
+            _workspace: workspace,
+            workspace_ptr,
+            stream,
+            plans: Mutex::new(HashMap::new()),
+            autotune,
+            tuning: AtomicBool::new(false),
+            tuned: Mutex::new(tuned),
+            tuned_dirty: AtomicBool::new(false),
+            tuning_file,
+        })
+    }
+
+    /// Write the tuned algorithms to the volume if this run timed any.
+    pub fn save_tuning(&self) {
+        let Some(file) = &self.tuning_file else { return };
+        if !self.tuned_dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let tuned = self.tuned.lock();
+        let ordered: BTreeMap<&String, Vec<u64>> = tuned.iter().map(|(k, v)| (k, v.to_vec())).collect();
+        let written = file
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(file, serde_json::to_string_pretty(&ordered).unwrap_or_default()));
+        match written {
+            Ok(()) => tracing::info!("{} tuned cuBLASLt algorithms saved to {}", ordered.len(), file.display()),
+            Err(error) => tracing::warn!("could not save the tuned algorithms to {}: {error}", file.display()),
+        }
     }
 
     /// Whether plans made from now on are tuned (see `autotune`).
     pub fn set_tuning(&self, on: bool) {
-        self.tuning.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.tuning.store(on, Ordering::Relaxed);
     }
 
     /// The common part of every call: `D[N x M] = alpha · A^T[N x K] · B[K x M]` in column-major terms. `scales`
@@ -353,7 +423,22 @@ impl Lt {
                 return Err(CudaError::Blas(format!("no cuBLASLt algorithm for {m}x{n}x{k} {:?}", a.1)));
             };
             let mut algo = first;
-            if self.autotune && self.tuning.load(std::sync::atomic::Ordering::Relaxed) && m >= AUTOTUNE_MIN_ROWS && candidates.len() > 1 {
+            let key = shape_key(a.1 as i32, out.1 as i32, m, n, k, scales.is_some(), bias.is_some());
+            // A saved choice, if cuBLASLt still accepts it for this configuration.
+            let saved = self.tuned.lock().get(&key).copied();
+            let mut from_cache = false;
+            if let Some(data) = saved {
+                let candidate = sys::cublasLtMatmulAlgo_t { data };
+                let mut result = std::mem::MaybeUninit::<sys::cublasLtMatmulHeuristicResult_t>::uninit();
+                let status = sys::cublasLtMatmulAlgoCheck(self.handle, desc.0, a_layout.0, b_layout.0, d_layout.0, d_layout.0, &candidate, result.as_mut_ptr());
+                if status == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS && result.assume_init().state == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    algo = candidate;
+                    from_cache = true;
+                } else {
+                    tracing::debug!("saved cuBLASLt algorithm for {key} no longer accepted; retuning");
+                }
+            }
+            if !from_cache && self.autotune && self.tuning.load(Ordering::Relaxed) && m >= AUTOTUNE_MIN_ROWS && candidates.len() > 1 {
                 let ctx = self.stream.context();
                 let start = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
                 let end = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
@@ -378,6 +463,8 @@ impl Lt {
                     }
                 }
                 tracing::debug!("cuBLASLt {m}x{n}x{k} {:?}: {} candidates, best {best:.3} ms, heuristic's first {first_ms:.3} ms", a.1, candidates.len());
+                self.tuned.lock().insert(key, algo.data);
+                self.tuned_dirty.store(true, Ordering::Relaxed);
             }
             Ok(Plan { desc, a: a_layout, b: b_layout, d: d_layout, algo })
         }

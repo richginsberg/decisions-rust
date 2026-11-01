@@ -47,41 +47,51 @@ pub struct Weights {
     locations: HashMap<String, usize>,
 }
 
-/// Pull a shard into the page cache with several threads while the loader works through it. From a cold
-/// network volume one reader gets a few hundred MB/s and the loader's layer-order walk is many small
-/// reads; a handful of streams in parallel, front to back, gets several times that and the loader finds its
-/// pages already there. DECISION_PREFETCH_THREADS (8) sets the count; 0 disables.
-fn prefetch(path: &Path, len: usize) {
+/// Pull the shards into the page cache, one shard after another in the loader's order, with several threads
+/// each. From a cold network volume one reader gets a few hundred MB/s and the loader's layer-order walk is
+/// many small reads; a handful of streams in parallel, front to back, gets several times that and the loader
+/// finds its pages already there. Shards go in sequence so the first one, which the loader needs first, has
+/// all the bandwidth. DECISION_PREFETCH_THREADS (8) sets the count; 0 disables.
+fn prefetch(shards: Vec<(PathBuf, usize)>) {
     use std::os::unix::fs::FileExt;
     let threads: usize = std::env::var("DECISION_PREFETCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-    if threads == 0 || len == 0 {
+    if threads == 0 {
         return;
     }
     const CHUNK: usize = 8 << 20;
-    let chunks = len.div_ceil(CHUNK);
-    for t in 0..threads {
-        let path = path.to_path_buf();
-        std::thread::Builder::new()
-            .name(format!("prefetch-{t}"))
-            .spawn(move || {
-                let Ok(file) = std::fs::File::open(&path) else { return };
-                let mut buffer = vec![0u8; CHUNK];
-                // Thread t takes chunks t, t + threads, ...: all threads advance through the file together,
-                // in the order the loader wants it.
-                for c in (t..chunks).step_by(threads) {
-                    let offset = c * CHUNK;
-                    let want = CHUNK.min(len - offset);
-                    let mut done = 0;
-                    while done < want {
-                        match file.read_at(&mut buffer[done..want], (offset + done) as u64) {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => done += n,
-                        }
-                    }
+    std::thread::Builder::new()
+        .name("prefetch".into())
+        .spawn(move || {
+            for (path, len) in shards {
+                let chunks = len.div_ceil(CHUNK);
+                let readers: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let path = path.clone();
+                        std::thread::spawn(move || {
+                            let Ok(file) = std::fs::File::open(&path) else { return };
+                            let mut buffer = vec![0u8; CHUNK];
+                            // Reader t takes chunks t, t + threads, ...: the readers advance through the file
+                            // together, in the order the loader wants it.
+                            for c in (t..chunks).step_by(threads) {
+                                let offset = c * CHUNK;
+                                let want = CHUNK.min(len - offset);
+                                let mut done = 0;
+                                while done < want {
+                                    match file.read_at(&mut buffer[done..want], (offset + done) as u64) {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(n) => done += n,
+                                    }
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                for reader in readers {
+                    let _ = reader.join();
                 }
-            })
-            .ok();
-    }
+            }
+        })
+        .ok();
 }
 
 impl Weights {
@@ -97,12 +107,13 @@ impl Weights {
         files.push("readout.safetensors".into());
         let mut shards = Vec::with_capacity(files.len());
         let mut locations = HashMap::new();
+        let mut to_prefetch = Vec::new();
         for (i, file) in files.iter().enumerate() {
             let path = checkpoint.join(file);
             let handle = std::fs::File::open(&path).map_err(|source| WeightsError::Read { path: path.clone(), source })?;
             // Safety: the files are the checkpoint's, which nothing writes while the server runs.
             let map = unsafe { Mmap::map(&handle) }.map_err(|source| WeightsError::Read { path: path.clone(), source })?;
-            prefetch(&path, map.len());
+            to_prefetch.push((path.clone(), map.len()));
             let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(map.as_ptr(), map.len()) };
             let tensors = SafeTensors::deserialize(bytes).map_err(|source| WeightsError::SafeTensors { path: path.clone(), source })?;
             for name in tensors.names() {
@@ -110,6 +121,7 @@ impl Weights {
             }
             shards.push(Shard { _map: map, tensors });
         }
+        prefetch(to_prefetch);
         Ok(Self { shards, locations })
     }
 

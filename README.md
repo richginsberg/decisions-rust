@@ -94,6 +94,8 @@ request take the heuristic's first choice (0 does so always).
 buckets warmed at load (to 4096 tokens), instead of some 700 kernel launches; 0 launches eagerly.
 `DECISION_PREFETCH_THREADS` (8): readers that pull each weight shard into the page cache in parallel while it
 loads, for cold volumes; 0 disables.
+`DECISION_TUNING_CACHE` (`<checkpoint>/.decision-tuning`): where the tuned cuBLASLt algorithms are kept between
+runs, per GPU and cuBLASLt version, so only the first start on a volume pays the tuning; empty disables.
 `DECISION_PROFILE` (0): with 1, every pass stage is timed (a stream sync after each) and reported in the
 `server-timing` response header and the log; for profiling only, since the syncs slow passes down.
 
