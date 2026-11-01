@@ -103,6 +103,39 @@ both; `scripts/compare_servers.py` sees probabilities within 0.07 (0.02 on avera
 On consumer Blackwell cuBLASLt has no rowwise FP8 scaling, so the FP8 projections run with scalar scales and a
 rescale kernel (`scale_rows_cols`).
 
+Phase 3 (2026-11-01): server-side medians on the 5090, proxy excluded, against the Python server on the same
+checkpoint: a 3,400-token pass 266 ms vs about 540; 1,000 tokens 79 vs 143; 150 tokens 30 vs 40; many-question
+medium requests about 2x. 315 of 316 labeled decisions agree (the one is a 0.50 vs 0.52 coin flip), accuracy
+96.2% vs 96.5%. Done: cuBLASLt plans cached per row bucket and their algorithms tuned at load; the delta rule on
+the tensor cores in fla's three-kernel structure (it was 73% of a long pass on CUDA cores); attention with
+cp.async double buffering and ldmatrix; the FP8 rescale fused into its consumers; warm-up passes at load.
+Startup is about 80 s from a warm volume (weights 43 s, warm-up and tuning 32 s). Where a long pass goes now:
+NVFP4 matmuls 37%, FP8 matmuls 22%, both near the GPU's peak; the delta rule 15%; attention 10%; elementwise
+kernels 16%. Not done: CUDA graphs (short requests are launch-bound at about 30 ms); the last layer computing
+every token rather than only the marker rows.
+
+## Environment
+
+The Pod's settings carry over: `AUTOJEV_API_KEY` (required),
+`AUTOJEV_CHECKPOINT`, `DECISION_MAX_LENGTH` (32768), `DECISION_MAX_BATCH_TOKENS` (16384),
+`DECISION_MAX_BATCH_ROWS` (64), `DECISION_MAX_QUEUE_SECONDS` (30), `DECISION_MODEL_NAME`, `PORT` (8000).
+`DECISION_PACKED` (1) packs a pass's sequences end to end instead of padding them.
+`DECISION_AUTOTUNE` (1): during the warm-up passes at load (every row bucket to 4096 tokens), time cuBLASLt's
+candidate algorithms for each matmul shape of 512 rows or more and keep the fastest; shapes first met on a live
+request take the heuristic's first choice (0 does so always).
+`DECISION_PROFILE` (0): with 1, every pass stage is timed (a stream sync after each) and reported in the
+`server-timing` response header and the log; for profiling only, since the syncs slow passes down.
+
+## Status
+
+Phase 1 (no GPU): protocol, API, batcher, weights loader, image preprocessing: done and tested.
+
+Phase 2: the kernels, the forward pass (text and vision) and the Docker image: done and verified on an RTX 5090
+(2026-10-31) against the Python server on the same checkpoint: 316 labeled decisions all agree, accuracy 96.5% on
+both; `scripts/compare_servers.py` sees probabilities within 0.07 (0.02 on average), where app.py accepts 0.2.
+On consumer Blackwell cuBLASLt has no rowwise FP8 scaling, so the FP8 projections run with scalar scales and a
+rescale kernel (`scale_rows_cols`).
+
 Phase 3 (in progress): startup 43 s from a warm volume. Server-side medians on the 5090, proxy excluded, against
 the Python server: 1 question x long input 415 vs 542 ms, 16 x medium 166 vs 317 ms, 16 x short 80 vs 129 ms;
 long inputs 20-25% faster, many-question requests up to 2x. Done: cuBLASLt plans cached per shape; the delta
