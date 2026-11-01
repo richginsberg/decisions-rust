@@ -17,9 +17,9 @@ const ROW_THREADS: u32 = 256;
 
 /// The delta-rule kernels' dynamic shared memory (deltanet.cu's DELTA_*_SMEM; QS = 136, TS = 72).
 pub const DELTA_CHUNK: usize = 64;
-const DELTA_CHUNK_SMEM: u32 = (2 * 64 * 136 * 2 + 64 * 64 * 4) as u32;
+const DELTA_CHUNK_SMEM: u32 = (2 * 64 * 136 * 2) as u32;
 const DELTA_STATE_SMEM: u32 = (64 * 136 * 2 + 32 * 72 * 2 + 128 * 72 * 2 + 64 * 4) as u32;
-const DELTA_OUT_SMEM: u32 = (128 * 136 * 2 + 128 * 72 * 2 + 64 * 136 * 2 + 64 * 72 * 2 + 64 * 4) as u32;
+const DELTA_OUT_SMEM: u32 = (32 * 136 * 2 + 32 * 72 * 2 + 64 * 136 * 2 + 64 * 72 * 2 + 64 * 4) as u32;
 
 /// Queries per attention block (attention.cu's QUERIES) and the kernels' dynamic shared memory
 /// (ATTENTION_SMEM / VISION_ATTENTION_SMEM: 2 stages x K and V x 32 keys x (D + 8) bf16).
@@ -342,10 +342,10 @@ impl Kernels {
         Ok(())
     }
 
-    /// The outputs: one block per (chunk, value head); out [N, 48, 128] bf16.
+    /// The outputs: four blocks per (chunk, value head), a quarter of the value dims each; out [N, 48, 128] bf16.
     #[allow(clippy::too_many_arguments)]
     pub fn delta_out(&self, chunks: &CudaSlice<u32>, n_chunks: usize, qkv: &CudaSlice<u16>, cum_decay: &CudaSlice<f32>, intra: &CudaSlice<u16>, states: &CudaSlice<u16>, vnew: &CudaSlice<u16>, out: &mut CudaSlice<u16>) -> Result<(), CudaError> {
-        let cfg = LaunchConfig { grid_dim: (n_chunks as u32, 48, 1), block_dim: (128, 1, 1), shared_mem_bytes: DELTA_OUT_SMEM };
+        let cfg = LaunchConfig { grid_dim: (n_chunks as u32, 48, 4), block_dim: (128, 1, 1), shared_mem_bytes: DELTA_OUT_SMEM };
         unsafe {
             self.stream.launch_builder(&self.delta_out).arg(chunks).arg(qkv).arg(cum_decay).arg(intra).arg(states).arg(vnew).arg(out).launch(cfg)?;
         }

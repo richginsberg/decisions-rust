@@ -22,6 +22,7 @@ use std::sync::Arc;
 use cudarc::cublaslt::result as lt;
 use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::sys::CUevent_flags;
 use parking_lot::Mutex;
 
 use super::CudaError;
@@ -63,7 +64,15 @@ pub struct Lt {
     workspace_ptr: *mut c_void,
     stream: Arc<CudaStream>,
     plans: Mutex<HashMap<Key, Plan>>,
+    /// Time the heuristic's candidates on first use of each shape and keep the fastest (DECISION_AUTOTUNE,
+    /// default on); the warm-up passes at load pay for it.
+    autotune: bool,
 }
+
+/// Heuristic candidates considered per shape, and the row count from which timing them is worth it (below
+/// it the matmuls are launch-bound and the heuristic's first choice is as good as any).
+const CANDIDATES: usize = 8;
+const AUTOTUNE_MIN_ROWS: usize = 512;
 
 /// What distinguishes one prepared matmul from another: everything but the A, B and D data pointers.
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
@@ -167,7 +176,8 @@ impl Lt {
             let (ptr, _record) = workspace.device_ptr(&stream);
             ptr as *mut c_void
         };
-        Ok(Self { handle, _workspace: workspace, workspace_ptr, stream, plans: Mutex::new(HashMap::new()) })
+        let autotune = std::env::var("DECISION_AUTOTUNE").map_or(true, |v| v != "0");
+        Ok(Self { handle, _workspace: workspace, workspace_ptr, stream, plans: Mutex::new(HashMap::new()), autotune })
     }
 
     /// The common part of every call: `D[N x M] = alpha · A^T[N x K] · B[K x M]` in column-major terms. `scales`
@@ -201,31 +211,48 @@ impl Lt {
         let plan = match plans.get(&key) {
             Some(plan) => plan,
             None => {
-                let plan = unsafe { self.prepare(a, b, out, m, n, k, scales, bias) }?;
+                let plan = unsafe { self.prepare(a, b, out, m, n, k, alpha, scales, bias) }?;
                 plans.entry(key).or_insert(plan)
             }
         };
+        unsafe { self.execute(&plan.desc, &plan.a, &plan.b, &plan.d, &plan.algo, a.0, b.0, out.0, alpha) }
+            .map_err(|e| blas(e, &format!("cublasLtMatmul {m}x{n}x{k} {:?}", a.1)))
+    }
+
+    /// One matmul launch with prepared descriptors and a given algorithm.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn execute(
+        &self,
+        desc: &Desc,
+        a_layout: &Layout,
+        b_layout: &Layout,
+        d_layout: &Layout,
+        algo: &sys::cublasLtMatmulAlgo_t,
+        a: *const c_void,
+        b: *const c_void,
+        out: *mut c_void,
+        alpha: f32,
+    ) -> Result<(), cudarc::cublaslt::result::CublasError> {
         let beta = 0.0f32;
         unsafe {
             lt::matmul(
                 self.handle,
-                plan.desc.0,
+                desc.0,
                 &alpha as *const f32 as *const c_void,
                 &beta as *const f32 as *const c_void,
-                a.0,
-                plan.a.0,
-                b.0,
-                plan.b.0,
-                out.0 as *const c_void,
-                plan.d.0,
-                out.0,
-                plan.d.0,
-                &plan.algo,
+                a,
+                a_layout.0,
+                b,
+                b_layout.0,
+                out as *const c_void,
+                d_layout.0,
+                out,
+                d_layout.0,
+                algo,
                 self.workspace_ptr,
                 WORKSPACE_BYTES,
                 self.stream.cu_stream() as sys::cudaStream_t,
             )
-            .map_err(|e| blas(e, &format!("cublasLtMatmul {m}x{n}x{k} {:?}", a.1)))
         }
     }
 
@@ -239,6 +266,7 @@ impl Lt {
         m: usize,
         n: usize,
         k: usize,
+        alpha: f32,
         scales: Option<(sys::cublasLtMatmulMatrixScale_t, *const c_void, *const c_void)>,
         bias: Option<*const c_void>,
     ) -> Result<Plan, CudaError> {
@@ -279,9 +307,63 @@ impl Lt {
                 size_of::<usize>(),
             )
             .map_err(|e| blas(e, "workspace preference"))?;
-            let heuristic = lt::get_matmul_algo_heuristic(self.handle, desc.0, a_layout.0, b_layout.0, d_layout.0, d_layout.0, pref.0)
-                .map_err(|e| blas(e, &format!("no cuBLASLt algorithm for {m}x{n}x{k} {:?}", a.1)))?;
-            Ok(Plan { desc, a: a_layout, b: b_layout, d: d_layout, algo: heuristic.algo })
+            // The heuristic's candidates, best first by its own estimate; timed on the real operands when the
+            // shape is large enough for the choice to matter.
+            let mut results: [std::mem::MaybeUninit<sys::cublasLtMatmulHeuristicResult_t>; CANDIDATES] =
+                [const { std::mem::MaybeUninit::uninit() }; CANDIDATES];
+            let mut count = 0i32;
+            let status = sys::cublasLtMatmulAlgoGetHeuristic(
+                self.handle,
+                desc.0,
+                a_layout.0,
+                b_layout.0,
+                d_layout.0,
+                d_layout.0,
+                pref.0,
+                CANDIDATES as i32,
+                results.as_mut_ptr() as *mut sys::cublasLtMatmulHeuristicResult_t,
+                &mut count,
+            );
+            if status != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(CudaError::Blas(format!("no cuBLASLt algorithm for {m}x{n}x{k} {:?}: {status:?}", a.1)));
+            }
+            let candidates: Vec<sys::cublasLtMatmulAlgo_t> = results[..count.max(0) as usize]
+                .iter()
+                .map(|r| r.assume_init())
+                .filter(|r| r.state == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS)
+                .map(|r| r.algo)
+                .collect();
+            let Some(&first) = candidates.first() else {
+                return Err(CudaError::Blas(format!("no cuBLASLt algorithm for {m}x{n}x{k} {:?}", a.1)));
+            };
+            let mut algo = first;
+            if self.autotune && m >= AUTOTUNE_MIN_ROWS && candidates.len() > 1 {
+                let ctx = self.stream.context();
+                let start = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+                let end = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+                let (mut best, mut first_ms) = (f32::INFINITY, 0.0f32);
+                for (i, candidate) in candidates.iter().enumerate() {
+                    if self.execute(&desc, &a_layout, &b_layout, &d_layout, candidate, a.0, b.0, out.0, alpha).is_err() {
+                        continue; // a candidate the heuristic offered but the call rejects
+                    }
+                    start.record(&self.stream)?;
+                    for _ in 0..2 {
+                        self.execute(&desc, &a_layout, &b_layout, &d_layout, candidate, a.0, b.0, out.0, alpha)
+                            .map_err(|e| blas(e, "timing a candidate"))?;
+                    }
+                    end.record(&self.stream)?;
+                    let ms = start.elapsed_ms(&end)? / 2.0;
+                    if i == 0 {
+                        first_ms = ms;
+                    }
+                    if ms < best {
+                        best = ms;
+                        algo = *candidate;
+                    }
+                }
+                tracing::debug!("cuBLASLt {m}x{n}x{k} {:?}: {} candidates, best {best:.3} ms, heuristic's first {first_ms:.3} ms", a.1, candidates.len());
+            }
+            Ok(Plan { desc, a: a_layout, b: b_layout, d: d_layout, algo })
         }
     }
 
