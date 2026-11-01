@@ -47,6 +47,43 @@ pub struct Weights {
     locations: HashMap<String, usize>,
 }
 
+/// Pull a shard into the page cache with several threads while the loader works through it. From a cold
+/// network volume one reader gets a few hundred MB/s and the loader's layer-order walk is many small
+/// reads; a handful of streams in parallel, front to back, gets several times that and the loader finds its
+/// pages already there. DECISION_PREFETCH_THREADS (8) sets the count; 0 disables.
+fn prefetch(path: &Path, len: usize) {
+    use std::os::unix::fs::FileExt;
+    let threads: usize = std::env::var("DECISION_PREFETCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    if threads == 0 || len == 0 {
+        return;
+    }
+    const CHUNK: usize = 8 << 20;
+    let chunks = len.div_ceil(CHUNK);
+    for t in 0..threads {
+        let path = path.to_path_buf();
+        std::thread::Builder::new()
+            .name(format!("prefetch-{t}"))
+            .spawn(move || {
+                let Ok(file) = std::fs::File::open(&path) else { return };
+                let mut buffer = vec![0u8; CHUNK];
+                // Thread t takes chunks t, t + threads, ...: all threads advance through the file together,
+                // in the order the loader wants it.
+                for c in (t..chunks).step_by(threads) {
+                    let offset = c * CHUNK;
+                    let want = CHUNK.min(len - offset);
+                    let mut done = 0;
+                    while done < want {
+                        match file.read_at(&mut buffer[done..want], (offset + done) as u64) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => done += n,
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
 impl Weights {
     pub fn open(checkpoint: &Path) -> Result<Self, WeightsError> {
         let index_path = checkpoint.join("model.safetensors.index.json");
@@ -65,11 +102,7 @@ impl Weights {
             let handle = std::fs::File::open(&path).map_err(|source| WeightsError::Read { path: path.clone(), source })?;
             // Safety: the files are the checkpoint's, which nothing writes while the server runs.
             let map = unsafe { Mmap::map(&handle) }.map_err(|source| WeightsError::Read { path: path.clone(), source })?;
-            // The loader walks tensors in layer order, which jumps around the file; from a cold volume that is
-            // many small random reads. Ask for sequential readahead of the whole shard, so the kernel streams
-            // it at the volume's full bandwidth while the first layers load (a hint only; harmless when warm).
-            let _ = map.advise(memmap2::Advice::Sequential);
-            let _ = map.advise(memmap2::Advice::WillNeed);
+            prefetch(&path, map.len());
             let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(map.as_ptr(), map.len()) };
             let tensors = SafeTensors::deserialize(bytes).map_err(|source| WeightsError::SafeTensors { path: path.clone(), source })?;
             for name in tensors.names() {
