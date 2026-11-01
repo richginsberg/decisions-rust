@@ -12,7 +12,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use parking_lot::Mutex;
 
-use super::blas::{ROW_BUCKET, Bf16Weight, Fp4Weight, Fp8Weight, Lt, swizzled_scale_bytes, swizzled_scale_index};
+use super::blas::{ROW_BUCKET, ROW_BUCKET_FROM, ROW_BUCKET_LARGE, bucket_rows, Bf16Weight, Fp4Weight, Fp8Weight, Lt, swizzled_scale_bytes, swizzled_scale_index};
 use super::kernels::Kernels;
 use super::{CudaError, forward};
 use crate::config::Checkpoint;
@@ -467,7 +467,7 @@ impl GpuModel {
         let weights_on_device = DeviceWeights { embeddings, layers, final_norm, readout, vision };
 
         // A multiple of the row bucket: the activation matmuls round their row count up to one.
-        let max_tokens = budget.max_tokens.max(ROW_BUCKET).div_ceil(ROW_BUCKET) * ROW_BUCKET;
+        let max_tokens = bucket_rows(budget.max_tokens.max(ROW_BUCKET));
         let workspace = Workspace::allocate(&stream, &checkpoint, max_tokens, !low_memory)?;
         let (free_after, _) = ctx.mem_get_info()?;
         tracing::info!("Weights and workspace on the device; {:.1} GiB free", free_after as f64 / (1u64 << 30) as f64);
@@ -480,9 +480,13 @@ impl GpuModel {
         // Warm up: CUDA loads each kernel on its first launch and cuBLASLt its own on the first call of each
         // row bucket (the first request after a start took about 2 s, and the first of each new length 50 to
         // 130 ms). One pass per bucket up to 2048 tokens; longer requests pay once.
+        // Every bucket up to 4096 tokens (64 apart to 2048, then 256 apart); the matmul algorithms are tuned
+        // only during these passes, so a longer request's first bucket costs a plan but no tuning.
         let warm_started = std::time::Instant::now();
         let mut passes = 0;
-        for length in (ROW_BUCKET..=2048.min(max_tokens)).step_by(ROW_BUCKET) {
+        let lengths = (ROW_BUCKET..=ROW_BUCKET_FROM).step_by(ROW_BUCKET).chain((ROW_BUCKET_FROM + ROW_BUCKET_LARGE..=4096).step_by(ROW_BUCKET_LARGE));
+        engine.lt.set_tuning(true);
+        for length in lengths.filter(|&l| l <= max_tokens) {
             passes += 1;
             let row = Encoded {
                 keys: vec!["warm".into()],
@@ -494,6 +498,7 @@ impl GpuModel {
             };
             forward::run(&mut engine, &checkpoint, &[&row])?;
         }
+        engine.lt.set_tuning(false);
         engine.last_profile = None;
         // The tokenizer builds its pre-tokenizer regexes on first use; one encode pays that before serving.
         let _ = encoder.count_tokens(&"The dashboard shows 'No data' after the update; the raw table has rows. ".repeat(40));
@@ -513,7 +518,7 @@ impl Workspace {
         let heads = text.linear_num_value_heads;
         let max_chunks = n.div_ceil(super::kernels::DELTA_CHUNK) + 64;
         let max_patches = if vision { MAX_IMAGES * (checkpoint.image_processor.size.longest_edge as usize / (vc.patch_size * vc.patch_size)) } else { 64 };
-        let max_patches = max_patches.div_ceil(ROW_BUCKET) * ROW_BUCKET;
+        let max_patches = bucket_rows(max_patches);
         let vh = vc.hidden_size;
         let patch_len = vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size;
         let merged = vh * vc.spatial_merge_size * vc.spatial_merge_size;

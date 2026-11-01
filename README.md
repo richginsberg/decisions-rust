@@ -87,8 +87,9 @@ The Pod's settings carry over: `AUTOJEV_API_KEY` (required),
 `AUTOJEV_CHECKPOINT`, `DECISION_MAX_LENGTH` (32768), `DECISION_MAX_BATCH_TOKENS` (16384),
 `DECISION_MAX_BATCH_ROWS` (64), `DECISION_MAX_QUEUE_SECONDS` (30), `DECISION_MODEL_NAME`, `PORT` (8000).
 `DECISION_PACKED` (1) packs a pass's sequences end to end instead of padding them.
-`DECISION_AUTOTUNE` (1): time cuBLASLt's candidate algorithms on first use of each matmul shape of 512 rows or
-more and keep the fastest (the warm-up passes at load pay for it; 0 takes the heuristic's first choice).
+`DECISION_AUTOTUNE` (1): during the warm-up passes at load (every row bucket to 4096 tokens), time cuBLASLt's
+candidate algorithms for each matmul shape of 512 rows or more and keep the fastest; shapes first met on a live
+request take the heuristic's first choice (0 does so always).
 `DECISION_PROFILE` (0): with 1, every pass stage is timed (a stream sync after each) and reported in the
 `server-timing` response header and the log; for profiling only, since the syncs slow passes down.
 

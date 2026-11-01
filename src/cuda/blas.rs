@@ -32,6 +32,15 @@ use super::CudaError;
 /// bucketed and the buckets are warmed at startup. Workspace buffers hold a multiple of this many rows, and
 /// the rows beyond the real ones hold stale values whose outputs nothing reads.
 pub const ROW_BUCKET: usize = 64;
+/// Above this many rows the bucket is `ROW_BUCKET_LARGE`: long requests rarely repeat a row count, and a bucket
+/// seen for the first time costs a plan (and, at load, its tuning).
+pub const ROW_BUCKET_FROM: usize = 2048;
+pub const ROW_BUCKET_LARGE: usize = 256;
+
+/// The row count a matmul of `m` rows is run with.
+pub fn bucket_rows(m: usize) -> usize {
+    if m <= ROW_BUCKET_FROM { m.div_ceil(ROW_BUCKET) * ROW_BUCKET } else { m.div_ceil(ROW_BUCKET_LARGE) * ROW_BUCKET_LARGE }
+}
 
 /// The cuBLASLt workspace, in bytes: cuBLASLt's own recommendation for Blackwell.
 pub const WORKSPACE_BYTES: usize = 32 << 20;
@@ -65,8 +74,10 @@ pub struct Lt {
     stream: Arc<CudaStream>,
     plans: Mutex<HashMap<Key, Plan>>,
     /// Time the heuristic's candidates on first use of each shape and keep the fastest (DECISION_AUTOTUNE,
-    /// default on); the warm-up passes at load pay for it.
+    /// default on), but only while `tuning` is set: during the warm-up passes at load. A shape first seen on a
+    /// live request takes the heuristic's first choice, since timing 8 candidates costs over a second.
     autotune: bool,
+    tuning: std::sync::atomic::AtomicBool,
 }
 
 /// Heuristic candidates considered per shape, and the row count from which timing them is worth it (below
@@ -177,7 +188,12 @@ impl Lt {
             ptr as *mut c_void
         };
         let autotune = std::env::var("DECISION_AUTOTUNE").map_or(true, |v| v != "0");
-        Ok(Self { handle, _workspace: workspace, workspace_ptr, stream, plans: Mutex::new(HashMap::new()), autotune })
+        Ok(Self { handle, _workspace: workspace, workspace_ptr, stream, plans: Mutex::new(HashMap::new()), autotune, tuning: std::sync::atomic::AtomicBool::new(false) })
+    }
+
+    /// Whether plans made from now on are tuned (see `autotune`).
+    pub fn set_tuning(&self, on: bool) {
+        self.tuning.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The common part of every call: `D[N x M] = alpha · A^T[N x K] · B[K x M]` in column-major terms. `scales`
@@ -337,7 +353,7 @@ impl Lt {
                 return Err(CudaError::Blas(format!("no cuBLASLt algorithm for {m}x{n}x{k} {:?}", a.1)));
             };
             let mut algo = first;
-            if self.autotune && m >= AUTOTUNE_MIN_ROWS && candidates.len() > 1 {
+            if self.autotune && self.tuning.load(std::sync::atomic::Ordering::Relaxed) && m >= AUTOTUNE_MIN_ROWS && candidates.len() > 1 {
                 let ctx = self.stream.context();
                 let start = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
                 let end = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
@@ -377,7 +393,7 @@ impl Lt {
         m: usize,
     ) -> Result<(), CudaError> {
         let (n, k) = (w.n, w.k);
-        let m = m.div_ceil(ROW_BUCKET) * ROW_BUCKET;
+        let m = bucket_rows(m);
         debug_assert!(x_packed.len() >= m * k / 2 && out.len() >= m * n);
         unsafe {
             let mode = sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
@@ -414,7 +430,7 @@ impl Lt {
         m: usize,
     ) -> Result<(), CudaError> {
         let (n, k) = (w.n, w.k);
-        let m = m.div_ceil(ROW_BUCKET) * ROW_BUCKET;
+        let m = bucket_rows(m);
         debug_assert!(x_values.len() >= m * k && acc.len() >= m * n);
         unsafe {
             let (w_ptr, _r3) = w.values.device_ptr(&self.stream);
@@ -437,7 +453,7 @@ impl Lt {
     /// `out[M, N] bf16 = x[M, K] bf16 · w^T (+ bias)` with M rounded up to the row bucket: for workspace buffers,
     /// whose rows are a multiple of it.
     pub fn bf16_padded(&self, x: &CudaSlice<u16>, w: &Bf16Weight, out: &mut CudaSlice<u16>, m: usize) -> Result<(), CudaError> {
-        self.bf16(x, w, out, m.div_ceil(ROW_BUCKET) * ROW_BUCKET)
+        self.bf16(x, w, out, bucket_rows(m))
     }
 
     /// `out[M, N] bf16 = x[M, K] bf16 · w^T (+ bias)` with exactly M rows.
