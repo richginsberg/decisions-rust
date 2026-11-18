@@ -8,9 +8,41 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// The protocol this server speaks, as pplx_decider declares it (protocol.py's PROTOCOL).
-pub const PROTOCOL_VERSION: u64 = 3;
-pub const PROTOCOL_TEMPLATE: &str = "joint-question-inline-readout-v1";
 pub const MARKER: &str = "<|fim_suffix|>";
+/// Ends the context in the chunked protocol (version 4).
+pub const SEPARATOR: &str = "<|fim_middle|>";
+
+/// The prompt protocol a checkpoint was trained with, declared in its `joint_config.json`. The model and the
+/// readout are the same under both; what differs is how a request becomes token sequences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// Version 3, `joint-question-inline-readout-v1` (pplx-decider v1.2): one sequence per request holding the
+    /// state and every numbered question.
+    InlineV3,
+    /// Version 4, `joint-chunked-readout-v1` (pplx-decider v1.3), in its default `separate` layout: one sequence
+    /// per question, the context (ending in the separator) followed by that question.
+    ChunkedV4,
+}
+
+impl Protocol {
+    pub fn version(self) -> u64 {
+        match self {
+            Protocol::InlineV3 => 3,
+            Protocol::ChunkedV4 => 4,
+        }
+    }
+
+    fn declared(joint: &JointConfig) -> Option<Self> {
+        if joint.marker != MARKER {
+            return None;
+        }
+        match (joint.version, joint.template.as_str(), joint.separator.as_deref()) {
+            (3, "joint-question-inline-readout-v1", None) => Some(Protocol::InlineV3),
+            (4, "joint-chunked-readout-v1", Some(SEPARATOR)) => Some(Protocol::ChunkedV4),
+            _ => None,
+        }
+    }
+}
 pub const MAX_OPTIONS: usize = 255;
 
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +167,8 @@ pub struct JointConfig {
     pub version: u64,
     pub template: String,
     pub marker: String,
+    #[serde(default)]
+    pub separator: Option<String>,
 }
 
 /// `processor_config.json`'s image processor settings (the few that matter for text + still images).
@@ -166,6 +200,7 @@ pub struct Checkpoint {
     pub model: ModelConfig,
     pub decision: DecisionConfig,
     pub image_processor: ImageProcessorConfig,
+    pub protocol: Protocol,
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigError> {
@@ -176,11 +211,13 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigError
 impl Checkpoint {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let joint: JointConfig = read_json(&path.join("joint_config.json"))?;
-        if joint.version != PROTOCOL_VERSION || joint.template != PROTOCOL_TEMPLATE || joint.marker != MARKER {
-            return Err(ConfigError::Invalid(
-                "This checkpoint does not declare the joint inline-readout protocol (version 3)".into(),
-            ));
-        }
+        let Some(protocol) = Protocol::declared(&joint) else {
+            return Err(ConfigError::Invalid(format!(
+                "This checkpoint declares joint protocol version {} ({}), which this server does not implement; it serves \
+                 version 3 (joint-question-inline-readout-v1) and version 4 (joint-chunked-readout-v1)",
+                joint.version, joint.template
+            )));
+        };
         let decision: DecisionConfig = read_json(&path.join("decision_config.json"))?;
         if decision.attention_mode != "noncausal_full_attention" || decision.pooling.as_deref().unwrap_or("last") != "last" {
             return Err(ConfigError::Invalid("Expected a noncausal checkpoint with per-position readouts".into()));
@@ -200,7 +237,7 @@ impl Checkpoint {
             return Err(ConfigError::Invalid("layer_types does not match num_hidden_layers".into()));
         }
         let processor: ProcessorConfig = read_json(&path.join("processor_config.json"))?;
-        Ok(Self { path: path.to_path_buf(), model, decision, image_processor: processor.image_processor })
+        Ok(Self { path: path.to_path_buf(), model, decision, image_processor: processor.image_processor, protocol })
     }
 
     /// The served name: `DECISION_MODEL_NAME`, or the checkpoint folder's name without a quantization
@@ -234,9 +271,23 @@ mod tests {
             model: serde_json::from_str(FIXTURE_MODEL).unwrap(),
             decision: serde_json::from_str(FIXTURE_DECISION).unwrap(),
             image_processor: serde_json::from_str(FIXTURE_PROCESSOR).unwrap(),
+            protocol: Protocol::InlineV3,
         };
         unsafe { std::env::remove_var("DECISION_MODEL_NAME") };
         assert_eq!(checkpoint.served_name(), "pplx-decider-v1.2");
+    }
+
+    #[test]
+    fn protocols_are_recognized_by_what_they_declare() {
+        let joint = |text: &str| serde_json::from_str::<JointConfig>(text).unwrap();
+        let v3 = joint(r#"{"version":3,"template":"joint-question-inline-readout-v1","marker":"<|fim_suffix|>","readout_offset":0}"#);
+        assert_eq!(Protocol::declared(&v3), Some(Protocol::InlineV3));
+        let v4 = joint(r#"{"version":4,"template":"joint-chunked-readout-v1","marker":"<|fim_suffix|>","separator":"<|fim_middle|>"}"#);
+        assert_eq!(Protocol::declared(&v4), Some(Protocol::ChunkedV4));
+        // A version with the wrong template, a version 4 without its separator, and an unknown version are refused.
+        assert_eq!(Protocol::declared(&joint(r#"{"version":4,"template":"joint-question-inline-readout-v1","marker":"<|fim_suffix|>"}"#)), None);
+        assert_eq!(Protocol::declared(&joint(r#"{"version":4,"template":"joint-chunked-readout-v1","marker":"<|fim_suffix|>"}"#)), None);
+        assert_eq!(Protocol::declared(&joint(r#"{"version":5,"template":"joint-chunked-readout-v1","marker":"<|fim_suffix|>","separator":"<|fim_middle|>"}"#)), None);
     }
 
     const FIXTURE_MODEL: &str = r#"{"text_config":{"hidden_size":8,"intermediate_size":16,"num_hidden_layers":2,

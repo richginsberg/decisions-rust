@@ -364,7 +364,7 @@ impl GpuModel {
         let weights = Arc::new(Weights::open(path)?);
         let tokenizer = tokenizers::Tokenizer::from_file(path.join("tokenizer.json")).map_err(|e| CudaError::Invalid(format!("tokenizer.json: {e}")))?;
         let pad_id = tokenizer.token_to_id("<|endoftext|>").ok_or_else(|| CudaError::Invalid("tokenizer has no <|endoftext|>".into()))?;
-        let encoder = Encoder::new(Box::new(tokenizer), checkpoint.decision.codes.clone(), pad_id, checkpoint.image_processor.merge_size)
+        let encoder = Encoder::with_protocol(checkpoint.protocol, Box::new(tokenizer), checkpoint.decision.codes.clone(), pad_id, checkpoint.image_processor.merge_size)
             .map_err(|e| CudaError::Invalid(e.to_string()))?;
         if encoder.image_pad_id != checkpoint.model.image_token_id {
             return Err(CudaError::Invalid("the tokenizer's <|image_pad|> is not config.json's image_token_id".into()));
@@ -377,6 +377,7 @@ impl GpuModel {
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let (free, total) = ctx.mem_get_info()?;
+        tracing::info!("Joint protocol version {}", checkpoint.protocol.version());
         tracing::info!("GPU 0: {:.1} GiB free of {:.1} GiB", free as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
         let kernels = Kernels::load(stream.clone())?;
         let lt = Lt::new(stream.clone(), Some(&path.join(".decision-tuning")))?;

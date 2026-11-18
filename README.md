@@ -15,7 +15,7 @@ tensor-core paths as before.
 
 | Path | What |
 |---|---|
-| `src/protocol.rs` | The joint prompt, tokenization and answers, token for token as pplx_decider's `protocol.py` |
+| `src/protocol.rs` | The joint prompt, tokenization and answers, token for token as pplx_decider's `protocol.py`, in both protocol versions (3: v1.2, 4: v1.3) |
 | `src/api.rs` | autojev's HTTP contract: routes, Bearer auth, request and response shape, error codes |
 | `src/batcher.rs` | Continuous batching in front of the GPU thread |
 | `src/model.rs` | What the server needs from a model; a CPU fake for the tests |
@@ -34,6 +34,7 @@ tensor-core paths as before.
 | `Dockerfile`, `scripts/start.sh`, `scripts/fetch_model.py` | The image: build with the CUDA toolkit, run on the CUDA runtime, fetch the checkpoint to the volume |
 | `scripts/compare_servers.py` | Send the same decisions to the Python and Rust servers and compare their probabilities |
 | `fixtures/encoder.json` | What the Python encoder produced for 156 requests (`scripts/make_encoder_fixture.py`) |
+| `fixtures/encoder_v4.json` | What v1.3's own `protocol.py` produced for 162 requests, 353 sequences, with real images (`scripts/make_encoder_fixture_v4.py`) |
 
 ## Building and testing without a GPU
 
@@ -48,7 +49,24 @@ Runs the encoder (prompt text), batcher, schema and route tests with the fake mo
 DECISION_CHECKPOINT=/path/to/pplx-decider-v1.2-NVFP4 cargo test --test encoder
 ```
 
+`DECISION_CHECKPOINT_V4` does the same for a version 4 checkpoint (pplx-decider v1.3).
+
 The server also runs end to end with the fake model: `cargo run -- --fake`.
+
+## Checkpoints and protocol versions
+
+The server reads the protocol a checkpoint declares in `joint_config.json` and encodes requests accordingly; the
+model, kernels and HTTP contract are the same for both. Anything else is refused at startup.
+
+| Checkpoint | Protocol | A request becomes |
+|---|---|---|
+| pplx-decider v1.2 | 3, `joint-question-inline-readout-v1` | one sequence: the state and every numbered question |
+| pplx-decider v1.3 | 4, `joint-chunked-readout-v1` (`separate` layout) | one sequence per question: the context, `<|fim_middle|>`, that question |
+
+Under version 4 every answer is independent of the request's other questions, and a request of Q questions
+runs its state Q times, so many-question requests over long states cost more than under version 3. Not
+implemented from v1.3: the `isolated` multi-question layout and the `locate-span` adapter. Switch checkpoints
+with `DECISION_MODEL_ID` and `DECISION_MODEL_REVISION`; the tuned-algorithm cache is per checkpoint directory.
 
 ## Building with the GPU
 

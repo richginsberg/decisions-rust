@@ -15,6 +15,7 @@ pub struct WordTokenizer;
 pub const WORD_PAD: u32 = 0;
 pub const WORD_MARKER: u32 = 1;
 pub const WORD_IMAGE_PAD: u32 = 2;
+pub const WORD_SEPARATOR: u32 = 3;
 
 impl WordTokenizer {
     pub fn id_of(token: &str) -> u32 {
@@ -22,13 +23,14 @@ impl WordTokenizer {
             "<|endoftext|>" => WORD_PAD,
             "<|fim_suffix|>" => WORD_MARKER,
             "<|image_pad|>" => WORD_IMAGE_PAD,
+            "<|fim_middle|>" => WORD_SEPARATOR,
             "bad" => u32::MAX,
             _ => {
                 let mut hash: u32 = 2166136261;
                 for byte in token.bytes() {
                     hash = (hash ^ byte as u32).wrapping_mul(16777619);
                 }
-                3 + hash % 1_000_000
+                4 + hash % 1_000_000
             }
         }
     }
@@ -67,6 +69,11 @@ impl Tokenize for WordTokenizer {
 pub fn word_encoder() -> Encoder {
     let codes: Vec<String> = (0..255).map(|i| if i < 26 { ((b'A' + i as u8) as char).to_string() } else { format!("{}{}", (b'A' + (i / 26 - 1) as u8) as char, (b'A' + (i % 26) as u8) as char) }).collect();
     word_encoder_with(codes)
+}
+
+/// A word encoder in a given protocol version.
+pub fn word_encoder_for(protocol: crate::config::Protocol, codes: Vec<String>) -> Encoder {
+    Encoder::with_protocol(protocol, Box::new(WordTokenizer), codes, WORD_PAD, 2).expect("word encoder")
 }
 
 pub fn word_encoder_with(codes: Vec<String>) -> Encoder {

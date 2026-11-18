@@ -238,7 +238,11 @@ async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes
     }
     // About how many tokens the request will take, for backpressure: its state once, plus each question.
     let state_text = crate::protocol::describe(&request.state);
-    let estimate = encoder.count_tokens(&state_text).unwrap_or(0) + 80 * request.questions.len();
+    let estimate = match encoder.protocol {
+        crate::config::Protocol::InlineV3 => encoder.count_tokens(&state_text).unwrap_or(0) + 80 * request.questions.len(),
+        // One sequence per question, each with the whole context: the rows' own lengths.
+        crate::config::Protocol::ChunkedV4 => rows.iter().map(|row| row.length()).sum(),
+    };
     let (questions, images, started) = (request.questions.len(), request.images.len(), Instant::now());
     let encode_ms = (started - encode_started).as_secs_f64() * 1000.0;
     match batcher.submit(request.questions, rows, estimate).await {
