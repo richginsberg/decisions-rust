@@ -230,19 +230,47 @@ async fn decide(State(service): State<AppState>, headers: HeaderMap, body: Bytes
     }
     let encode_started = Instant::now();
     let encoder = model.encoder();
-    let prepared = images::prepare_all(&request.images, model.as_ref()).map_err(|m| ApiError::new(422, m))?;
-    let grids: Vec<_> = prepared.iter().map(|image| image.grid).collect();
-    let mut rows = encoder.plan(&request, &grids, Some(limit_of(model.as_ref()))).map_err(|error| ApiError::from_failure(Failure::from_protocol(error)))?;
-    for row in &mut rows {
-        row.pixels = prepared.clone();
+    let limit = limit_of(model.as_ref());
+    let protocol_error = |error| ApiError::from_failure(Failure::from_protocol(error));
+
+    // "locate" questions are answered by the Locate adapter in sequences of their own; the others as without
+    // it. Locate's rules are checked first, as pplx_decider checks them.
+    let located: Vec<(String, crate::protocol::Question)> = request.questions.iter().filter(|(_, q)| q.is_locate()).cloned().collect();
+    let mut locate_rows = Vec::new();
+    if !located.is_empty() {
+        let Some(locate) = model.locate() else {
+            return Err(ApiError::new(422, "'locate' questions need a checkpoint with a locate-span/ adapter"));
+        };
+        let labels = locate.validate(&request.state, request.images.len(), request.questions.len(), &located).map_err(protocol_error)?;
+        let keys: Vec<String> = located.iter().map(|(key, _)| key.clone()).collect();
+        let state = request.state.as_str().unwrap_or_default();
+        locate_rows = locate.plan(state, &keys, &labels, Some(limit)).map_err(protocol_error)?;
     }
-    // About how many tokens the request will take, for backpressure: its state once, plus each question.
-    let state_text = crate::protocol::describe(&request.state);
-    let estimate = match encoder.protocol {
-        crate::config::Protocol::InlineV3 => encoder.count_tokens(&state_text).unwrap_or(0) + 80 * request.questions.len(),
-        // One sequence per question, each with the whole context: the rows' own lengths.
-        crate::config::Protocol::ChunkedV4 => rows.iter().map(|row| row.length()).sum(),
+    let decisions = Request {
+        state: request.state.clone(),
+        questions: request.questions.iter().filter(|(_, q)| !q.is_locate()).cloned().collect(),
+        images: request.images.clone(),
     };
+    let mut rows = Vec::new();
+    let mut estimate = 0;
+    if !decisions.questions.is_empty() {
+        let prepared = images::prepare_all(&decisions.images, model.as_ref()).map_err(|m| ApiError::new(422, m))?;
+        let grids: Vec<_> = prepared.iter().map(|image| image.grid).collect();
+        rows = encoder.plan(&decisions, &grids, Some(limit)).map_err(protocol_error)?;
+        for row in &mut rows {
+            row.pixels = prepared.clone();
+        }
+        // About how many tokens the request will take, for backpressure: its state once, plus each question.
+        estimate = match encoder.protocol {
+            crate::config::Protocol::InlineV3 => {
+                encoder.count_tokens(&crate::protocol::describe(&decisions.state)).unwrap_or(0) + 80 * decisions.questions.len()
+            }
+            // One sequence per question, each with the whole context: the rows' own lengths.
+            crate::config::Protocol::ChunkedV4 => rows.iter().map(|row| row.length()).sum(),
+        };
+    }
+    estimate += locate_rows.iter().map(|row| row.length()).sum::<usize>();
+    rows.extend(locate_rows);
     let (questions, images, started) = (request.questions.len(), request.images.len(), Instant::now());
     let encode_ms = (started - encode_started).as_secs_f64() * 1000.0;
     match batcher.submit(request.questions, rows, estimate).await {

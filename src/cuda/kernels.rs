@@ -49,6 +49,10 @@ pub struct Kernels {
     delta_chunk: CudaFunction,
     delta_state: CudaFunction,
     delta_out: CudaFunction,
+    attention_split: CudaFunction,
+    delta_state_carry: CudaFunction,
+    conv1d_silu_indexed: CudaFunction,
+    silu_mul: CudaFunction,
     gated_norm: CudaFunction,
     gather_rows: CudaFunction,
     scatter_rows: CudaFunction,
@@ -88,6 +92,10 @@ impl Kernels {
         let delta_out = f("delta_out")?;
         let attention = f("attention")?;
         let vision_attention = f("vision_attention")?;
+        let attention_split = f("attention_split")?;
+        let delta_state_carry = f("delta_state_carry")?;
+        attention_split.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, ATTENTION_SMEM as i32)?;
+        delta_state_carry.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DELTA_STATE_SMEM as i32)?;
         attention.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, ATTENTION_SMEM as i32)?;
         vision_attention.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, VISION_ATTENTION_SMEM as i32)?;
         delta_chunk.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DELTA_CHUNK_SMEM as i32)?;
@@ -113,6 +121,10 @@ impl Kernels {
             delta_chunk,
             delta_state,
             delta_out,
+            attention_split,
+            delta_state_carry,
+            conv1d_silu_indexed: f("conv1d_silu_indexed")?,
+            silu_mul: f("silu_mul")?,
             gated_norm: f("gated_norm")?,
             gather_rows: f("gather_rows")?,
             scatter_rows: f("scatter_rows")?,
@@ -269,6 +281,24 @@ impl Kernels {
         Ok(())
     }
 
+    /// Text attention over split tiles (6 u32 each: query start and count, two key ranges): the isolated-question
+    /// layout of Locate. Buffers as `attention`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_split(&self, tiles: &CudaSlice<u32>, n_tiles: usize, q: &CudaSlice<u16>, k: &CudaSlice<u16>, v: &CudaSlice<u16>, gate: Ptr, out: &mut CudaSlice<u16>, heads: usize, kv_heads: usize, scale: f32) -> Result<(), CudaError> {
+        let (q_stride, kv_stride, gate_stride, gate_head_stride, out_stride) = ((heads * 256) as u32, (kv_heads * 256) as u32, (heads * 512) as u32, 512u32, (heads * 256) as u32);
+        let (heads32, kv32) = (heads as u32, kv_heads as u32);
+        let scale_log2 = scale * std::f32::consts::LOG2_E;
+        let cfg = LaunchConfig { grid_dim: (n_tiles as u32, heads32, 1), block_dim: (256, 1, 1), shared_mem_bytes: ATTENTION_SMEM };
+        unsafe {
+            self.stream
+                .launch_builder(&self.attention_split)
+                .arg(tiles).arg(q).arg(k).arg(v).arg(&gate).arg(out)
+                .arg(&q_stride).arg(&kv_stride).arg(&gate_stride).arg(&gate_head_stride).arg(&out_stride).arg(&heads32).arg(&kv32).arg(&scale_log2)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
     /// Vision attention: q/k/v inside the qkv buffer [N, 3, heads, 72]; out [N, heads * 72].
     #[allow(clippy::too_many_arguments)]
     pub fn vision_attention(&self, tiles: &CudaSlice<u32>, n_tiles: usize, qkv: &CudaSlice<u16>, out: &mut CudaSlice<u16>, heads: usize, scale: f32) -> Result<(), CudaError> {
@@ -310,6 +340,24 @@ impl Kernels {
         Ok(())
     }
 
+    /// The causal conv + SiLU with each token's three predecessors given by index (`sources` [N, 3], -1: none).
+    pub fn conv1d_silu_indexed(&self, x: &CudaSlice<u16>, w: &CudaSlice<u16>, sources: &CudaSlice<i32>, y: &mut CudaSlice<u16>, rows: usize, c: usize) -> Result<(), CudaError> {
+        let (n32, c32) = (rows as u32, c as u32);
+        unsafe {
+            self.stream.launch_builder(&self.conv1d_silu_indexed).arg(x).arg(w).arg(sources).arg(y).arg(&n32).arg(&c32).launch(Self::elements(rows * c, 8))?;
+        }
+        Ok(())
+    }
+
+    /// silu(gate) * up in bf16 from the merged [rows, 2n] matmul output, into `out` [rows, n] (an address).
+    pub fn silu_mul(&self, gate_up: &CudaSlice<u16>, out: Ptr, rows: usize, n: usize) -> Result<(), CudaError> {
+        let (n32, rows32) = (n as u32, rows as u32);
+        unsafe {
+            self.stream.launch_builder(&self.silu_mul).arg(gate_up).arg(&out).arg(&n32).arg(&rows32).launch(Self::elements(rows * n, 8))?;
+        }
+        Ok(())
+    }
+
     /// Depthwise causal conv (kernel 4) + SiLU over packed sequences: x, y [N, c]; w [c, 4]; seq_of [N] sequence starts.
     pub fn conv1d_silu(&self, x: &CudaSlice<u16>, w: &CudaSlice<u16>, seq_of: &CudaSlice<i32>, y: &mut CudaSlice<u16>, rows: usize, c: usize) -> Result<(), CudaError> {
         let (n32, c32) = (rows as u32, c as u32);
@@ -338,6 +386,19 @@ impl Kernels {
         let cfg = LaunchConfig { grid_dim: (n_seqs as u32, 48, 4), block_dim: (64, 1, 1), shared_mem_bytes: DELTA_STATE_SMEM };
         unsafe {
             self.stream.launch_builder(&self.delta_state).arg(seqs).arg(chunks).arg(kt).arg(u).arg(w).arg(cum_decay).arg(states).arg(vnew).launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// The state walk of `n_seqs` sequences starting at `seqs` (an address into the sequence table), optionally
+    /// starting each from the state saved in `carry` [48, 128, 128] f32 and optionally saving the final state
+    /// there (one sequence then).
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_state_carry(&self, seqs: Ptr, n_seqs: usize, chunks: &CudaSlice<u32>, kt: &CudaSlice<u16>, u: &CudaSlice<u16>, w: &CudaSlice<u16>, cum_decay: &CudaSlice<f32>, states: &mut CudaSlice<u16>, vnew: &mut CudaSlice<u16>, carry: &mut CudaSlice<f32>, carry_in: bool, carry_out: bool) -> Result<(), CudaError> {
+        let cfg = LaunchConfig { grid_dim: (n_seqs as u32, 48, 4), block_dim: (64, 1, 1), shared_mem_bytes: DELTA_STATE_SMEM };
+        let (load, save) = (carry_in as u32, carry_out as u32);
+        unsafe {
+            self.stream.launch_builder(&self.delta_state_carry).arg(&seqs).arg(chunks).arg(kt).arg(u).arg(w).arg(cum_decay).arg(states).arg(vnew).arg(carry).arg(&load).arg(&save).launch(cfg)?;
         }
         Ok(())
     }

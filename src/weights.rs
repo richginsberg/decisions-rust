@@ -105,12 +105,17 @@ impl Weights {
         files.sort();
         files.dedup();
         files.push("readout.safetensors".into());
+        let paths: Vec<PathBuf> = files.iter().map(|file| checkpoint.join(file)).collect();
+        Self::open_files(&paths)
+    }
+
+    /// The tensors of the given safetensors files, memory-mapped (and pulled into the page cache in order).
+    pub fn open_files(files: &[PathBuf]) -> Result<Self, WeightsError> {
         let mut shards = Vec::with_capacity(files.len());
         let mut locations = HashMap::new();
         let mut to_prefetch = Vec::new();
-        for (i, file) in files.iter().enumerate() {
-            let path = checkpoint.join(file);
-            let handle = std::fs::File::open(&path).map_err(|source| WeightsError::Read { path: path.clone(), source })?;
+        for (i, path) in files.iter().enumerate() {
+            let handle = std::fs::File::open(path).map_err(|source| WeightsError::Read { path: path.clone(), source })?;
             // Safety: the files are the checkpoint's, which nothing writes while the server runs.
             let map = unsafe { Mmap::map(&handle) }.map_err(|source| WeightsError::Read { path: path.clone(), source })?;
             to_prefetch.push((path.clone(), map.len()));
@@ -182,6 +187,11 @@ impl Weights {
 
     pub fn bf16(&self, name: &str, shape: &[Option<usize>]) -> Result<(&[u8], Vec<usize>), WeightsError> {
         self.bytes(name, Dtype::BF16, shape)
+    }
+
+    /// An f32 tensor's little-endian bytes (the Locate adapter and head are stored in FP32).
+    pub fn f32(&self, name: &str, shape: &[Option<usize>]) -> Result<(&[u8], Vec<usize>), WeightsError> {
+        self.bytes(name, Dtype::F32, shape)
     }
 }
 

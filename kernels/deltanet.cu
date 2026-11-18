@@ -273,12 +273,17 @@ extern "C" __global__ void delta_chunk(const DeltaChunk* __restrict__ chunks, co
 #define STATE_ROWS (DV / STATE_SPLIT)
 #define DELTA_STATE_SMEM (CHUNK * QS * 2 + STATE_ROWS * TS * 2 + DK * TS * 2 + CHUNK * 4)
 
-extern "C" __global__ void delta_state(const DeltaSeq* __restrict__ seqs, const DeltaChunk* __restrict__ chunks,
-                                       const bf16* __restrict__ kt_in, const bf16* __restrict__ u_in,
-                                       const bf16* __restrict__ w_in, const float* __restrict__ cum_decay,
-                                       bf16* __restrict__ states, bf16* __restrict__ vnew_out) {
-    extern __shared__ __align__(16) unsigned char dsmem[];
-    bf16* ws = reinterpret_cast<bf16*>(dsmem);  // [64][QS]
+// CARRY: the walk may start from a saved state (`carry_in`) and may save its final state (`carry_out`), both in
+// `carry` [48][128][128] f32. Locate's isolated questions use it: the context's walk saves its state, and every
+// question block starts from it.
+template <bool CARRY>
+__device__ void delta_state_impl(const DeltaSeq* __restrict__ seqs, const DeltaChunk* __restrict__ chunks,
+                                 const bf16* __restrict__ kt_in, const bf16* __restrict__ u_in,
+                                 const bf16* __restrict__ w_in, const float* __restrict__ cum_decay,
+                                 bf16* __restrict__ states, bf16* __restrict__ vnew_out, float* carry,
+                                 uint32_t carry_in, uint32_t carry_out) {
+    extern __shared__ __align__(16) unsigned char state_smem[];
+    bf16* ws = reinterpret_cast<bf16*>(state_smem);  // [64][QS]
     bf16* vT = ws + CHUNK * QS;                  // [32][TS]: v_new^T, this block's 32 value dims
     bf16* kT = vT + STATE_ROWS * TS;             // [128][TS]: (k exp(cum_last - cum))^T
     float* cum = reinterpret_cast<float*>(kT + DK * TS);
@@ -294,6 +299,17 @@ extern "C" __global__ void delta_state(const DeltaSeq* __restrict__ seqs, const 
     for (int nt = 0; nt < DK / 8; nt++)
 #pragma unroll
         for (int e = 0; e < 4; e++) hT[nt][e] = 0.f;
+    // This thread's entries of S^T: rows nbase + wrow + g (and + 8), columns nt * 8 + 2t (and + 1).
+    float* carried = CARRY ? carry + ((size_t)h * DV + nbase + wrow + g) * DK + 2 * t : nullptr;
+    if (CARRY && carry_in) {
+#pragma unroll
+        for (int nt = 0; nt < DK / 8; nt++) {
+            hT[nt][0] = carried[nt * 8];
+            hT[nt][1] = carried[nt * 8 + 1];
+            hT[nt][2] = carried[8 * DK + nt * 8];
+            hT[nt][3] = carried[8 * DK + nt * 8 + 1];
+        }
+    }
 
     for (uint32_t ci = 0; ci < s.chunks; ci++) {
         const uint32_t chunk = s.first_chunk + ci;
@@ -379,6 +395,31 @@ extern "C" __global__ void delta_state(const DeltaSeq* __restrict__ seqs, const 
             }
         }
     }
+    if (CARRY && carry_out) {
+#pragma unroll
+        for (int nt = 0; nt < DK / 8; nt++) {
+            carried[nt * 8] = hT[nt][0];
+            carried[nt * 8 + 1] = hT[nt][1];
+            carried[8 * DK + nt * 8] = hT[nt][2];
+            carried[8 * DK + nt * 8 + 1] = hT[nt][3];
+        }
+    }
+}
+
+extern "C" __global__ void delta_state(const DeltaSeq* __restrict__ seqs, const DeltaChunk* __restrict__ chunks,
+                                       const bf16* __restrict__ kt_in, const bf16* __restrict__ u_in,
+                                       const bf16* __restrict__ w_in, const float* __restrict__ cum_decay,
+                                       bf16* __restrict__ states, bf16* __restrict__ vnew_out) {
+    delta_state_impl<false>(seqs, chunks, kt_in, u_in, w_in, cum_decay, states, vnew_out, nullptr, 0, 0);
+}
+
+// The same walk with a carried state (see delta_state_impl); the flags apply to every sequence of the launch.
+extern "C" __global__ void delta_state_carry(const DeltaSeq* __restrict__ seqs, const DeltaChunk* __restrict__ chunks,
+                                             const bf16* __restrict__ kt_in, const bf16* __restrict__ u_in,
+                                             const bf16* __restrict__ w_in, const float* __restrict__ cum_decay,
+                                             bf16* __restrict__ states, bf16* __restrict__ vnew_out, float* carry,
+                                             uint32_t carry_in, uint32_t carry_out) {
+    delta_state_impl<true>(seqs, chunks, kt_in, u_in, w_in, cum_decay, states, vnew_out, carry, carry_in, carry_out);
 }
 
 // ---------------------------------------------------------------------------------------------------------

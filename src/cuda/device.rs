@@ -176,6 +176,8 @@ pub struct Engine {
     pub last_profile: Option<String>,
     /// Captured graphs of the text layers, per row bucket (DECISION_GRAPHS=0 disables them).
     pub graphs: Graphs,
+    /// The Locate adapter, when the checkpoint has one (see `super::locate`).
+    pub locate: Option<super::locate::LocateWeights>,
 }
 
 pub struct GpuModel {
@@ -186,6 +188,8 @@ pub struct GpuModel {
     max_length: usize,
     engine: Mutex<Engine>,
     last_profile: Mutex<Option<String>>,
+    /// The encoder of `"locate"` questions, present when the adapter loaded.
+    locate_encoder: Option<crate::locate::LocateEncoder>,
 }
 
 // --- CPU-side conversions -------------------------------------------------------------------------------------
@@ -485,7 +489,14 @@ impl GpuModel {
 
         // A multiple of the row bucket: the activation matmuls round their row count up to one.
         let max_tokens = bucket_rows(budget.max_tokens.max(ROW_BUCKET));
-        let workspace = Workspace::allocate(&stream, &checkpoint, max_tokens, !low_memory, budget.max_rows.max(1), weights_on_device.readout.n)?;
+        // Locate: a version 4 checkpoint with locate-span/ beside it (DECISION_LOCATE=0 leaves it out; low memory
+        // mode has no room for it).
+        let locate_dir = path.join("locate-span");
+        let want_locate = !low_memory
+            && checkpoint.protocol == crate::config::Protocol::ChunkedV4
+            && std::env::var("DECISION_LOCATE").map_or(true, |v| v != "0")
+            && locate_dir.join("locate_config.json").is_file();
+        let workspace = Workspace::allocate(&stream, &checkpoint, max_tokens, !low_memory, budget.max_rows.max(1), weights_on_device.readout.n, want_locate)?;
         let (free_after, _) = ctx.mem_get_info()?;
         tracing::info!("Weights and workspace on the device; {:.1} GiB free", free_after as f64 / (1u64 << 30) as f64);
         let profile = std::env::var("DECISION_PROFILE").is_ok_and(|v| v == "1");
@@ -493,7 +504,7 @@ impl GpuModel {
             tracing::warn!("DECISION_PROFILE=1: every pass stage is timed with a sync; expect slower passes");
         }
         let graphs = Graphs::new(stream.clone());
-        let mut engine = Engine { stream, lt, kernels, weights: weights_on_device, workspace, profile, last_profile: None, graphs };
+        let mut engine = Engine { stream, lt, kernels, weights: weights_on_device, workspace, profile, last_profile: None, graphs, locate: None };
 
         // Warm up: CUDA loads each kernel on its first launch and cuBLASLt its own on the first call of each
         // row bucket (the first request after a start took about 2 s, and the first of each new length 50 to
@@ -512,6 +523,7 @@ impl GpuModel {
                 markers: vec![length - 1],
                 images: Vec::new(),
                 pixels: Vec::new(),
+                locate: None,
             };
             forward::run(&mut engine, &checkpoint, &[&row])?;
         }
@@ -530,7 +542,56 @@ impl GpuModel {
         // The tokenizer builds its pre-tokenizer regexes on first use; one encode pays that before serving.
         let _ = encoder.count_tokens(&"The dashboard shows 'No data' after the update; the raw table has rows. ".repeat(40));
         tracing::info!("{passes} warm-up passes in {:.0} ms", warm_started.elapsed().as_secs_f64() * 1000.0);
-        Ok(Self { checkpoint, low_memory, encoder, budget, max_length, engine: Mutex::new(engine), last_profile: Mutex::new(None) })
+        // The adapter loads last and never stops the server: without it, locate questions are refused.
+        let mut locate_encoder = None;
+        if want_locate {
+            let started = std::time::Instant::now();
+            match Self::load_locate(&mut engine, &checkpoint, &locate_dir, path, pad_id, max_tokens) {
+                Ok(encoder) => {
+                    let (free, _) = ctx.mem_get_info()?;
+                    tracing::info!("Locate adapter loaded and checked in {:.1} s; {:.1} GiB free", started.elapsed().as_secs_f64(), free as f64 / (1u64 << 30) as f64);
+                    locate_encoder = Some(encoder);
+                }
+                Err(error) => {
+                    engine.locate = None;
+                    tracing::error!("Locate is unavailable: {error}");
+                }
+            }
+        }
+        Ok(Self { checkpoint, low_memory, encoder, budget, max_length, engine: Mutex::new(engine), last_profile: Mutex::new(None), locate_encoder })
+    }
+
+    /// Load `locate-span/`, build its encoder, and run one small locate pass so a broken adapter or kernel shows
+    /// at startup rather than on a request.
+    fn load_locate(engine: &mut Engine, checkpoint: &Checkpoint, directory: &Path, checkpoint_path: &Path, pad_id: u32, max_tokens: usize) -> Result<crate::locate::LocateEncoder, CudaError> {
+        let invalid = |message: String| CudaError::Invalid(message);
+        let text = std::fs::read_to_string(directory.join("locate_config.json")).map_err(|e| invalid(format!("locate_config.json: {e}")))?;
+        let config: crate::locate::LocateConfig = serde_json::from_str(&text).map_err(|e| invalid(format!("locate_config.json: {e}")))?;
+        let tokenizer = tokenizers::Tokenizer::from_file(checkpoint_path.join("tokenizer.json")).map_err(|e| invalid(format!("tokenizer.json: {e}")))?;
+        if let Some(token) = tokenizer.id_to_token(config.marker_id) {
+            return Err(invalid(format!("the Locate marker id {} is the tokenizer's {token}", config.marker_id)));
+        }
+        let encoder = crate::locate::LocateEncoder::new(Box::new(tokenizer), checkpoint.decision.codes.clone(), pad_id, checkpoint.image_processor.merge_size, config.marker_id)
+            .map_err(|e| invalid(e.to_string()))?;
+        engine.locate = Some(super::locate::LocateWeights::load(&engine.stream, checkpoint, directory, &config, max_tokens)?);
+        // The adapter records the full-precision checkpoint it was trained on; this one is its quantization, so
+        // the recorded file hashes are not enforced (config.json differs by its quantization section).
+        tracing::info!(
+            "Locate adapter: rank {} on {} layers, trained on {}@{}",
+            config.lora.rank,
+            checkpoint.model.text_config.num_hidden_layers,
+            config.base.repo.as_deref().unwrap_or("an unnamed base"),
+            config.base.revision.as_deref().map_or("?", |r| &r[..r.len().min(7)])
+        );
+        let keys = vec!["first".to_string(), "second".to_string()];
+        let rows = encoder
+            .plan("Acme Corp sent invoice 4471 to Jane Doe on March 3.", &keys, &["Company names".to_string(), "Dates".to_string()], Some(max_tokens))
+            .map_err(|e| invalid(e.to_string()))?;
+        for row in &rows {
+            let spans = super::locate::run(engine, checkpoint, row)?;
+            tracing::debug!("Locate warm-up: {:?} spans", spans.iter().map(Vec::len).collect::<Vec<_>>());
+        }
+        Ok(encoder)
     }
 }
 
@@ -543,7 +604,7 @@ fn warm_lengths(max_tokens: usize) -> impl Iterator<Item = usize> {
 }
 
 impl Workspace {
-    fn allocate(stream: &Arc<CudaStream>, checkpoint: &Checkpoint, n: usize, vision: bool, max_seqs: usize, options: usize) -> Result<Self, CudaError> {
+    fn allocate(stream: &Arc<CudaStream>, checkpoint: &Checkpoint, n: usize, vision: bool, max_seqs: usize, options: usize, locate: bool) -> Result<Self, CudaError> {
         let text = &checkpoint.model.text_config;
         let vc = &checkpoint.model.vision_config;
         let hidden = text.hidden_size;
@@ -552,7 +613,8 @@ impl Workspace {
         let v_dim = text.linear_value_dim();
         let heads = text.linear_num_value_heads;
         let counts = forward::Counts::of(n, max_seqs);
-        let max_chunks = counts.chunks;
+        // A locate pass chunks its context and each of up to 128 question blocks separately.
+        let max_chunks = if locate { n / super::kernels::DELTA_CHUNK + max_seqs.max(crate::locate::MAX_QUESTIONS + 2) } else { counts.chunks };
         let max_patches = if vision { MAX_IMAGES * (checkpoint.image_processor.size.longest_edge as usize / (vc.patch_size * vc.patch_size)) } else { 64 };
         let max_patches = bucket_rows(max_patches);
         let vh = vc.hidden_size;
@@ -631,6 +693,17 @@ impl Model for GpuModel {
     }
     fn last_profile(&self) -> Option<String> {
         self.last_profile.lock().clone()
+    }
+    fn locate(&self) -> Option<&crate::locate::LocateEncoder> {
+        self.locate_encoder.as_ref()
+    }
+    fn run_locate(&self, row: &Encoded) -> Result<Vec<Vec<crate::locate::TokenSpan>>, PassError> {
+        let mut engine = self.engine.lock();
+        super::locate::run(&mut engine, &self.checkpoint, row).map_err(|error| match error {
+            CudaError::OutOfMemory => PassError::OutOfMemory,
+            CudaError::Invalid(message) => PassError::Request(message),
+            other => PassError::Internal(other.to_string()),
+        })
     }
     fn run_pass(&self, rows: &[&Encoded]) -> Result<Vec<RowAnswers>, PassError> {
         let mut engine = self.engine.lock();

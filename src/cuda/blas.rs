@@ -110,6 +110,10 @@ struct Key {
     a_scale: usize,
     b_scale: usize,
     bias: usize,
+    /// The output's row stride in elements (n unless the result goes into a wider buffer).
+    d_ld: usize,
+    /// Whether the product is added to the output (beta = 1) rather than replacing it.
+    accumulate: bool,
 }
 
 /// A prepared matmul: its descriptor, layouts and the algorithm the heuristic chose.
@@ -280,9 +284,13 @@ impl Lt {
         alpha: f32,
         scales: Option<(sys::cublasLtMatmulMatrixScale_t, *const c_void, *const c_void)>,
         bias: Option<*const c_void>,
+        d_ld: usize,
+        beta: f32,
     ) -> Result<(), CudaError> {
         let blas = |e: cudarc::cublaslt::result::CublasError, what: &str| CudaError::Blas(format!("{what}: {e:?}"));
         let key = Key {
+            d_ld,
+            accumulate: beta != 0.0,
             a_type: a.1 as i32,
             out_type: out.1 as i32,
             m,
@@ -297,11 +305,11 @@ impl Lt {
         let plan = match plans.get(&key) {
             Some(plan) => plan,
             None => {
-                let plan = unsafe { self.prepare(a, b, out, m, n, k, alpha, scales, bias) }?;
+                let plan = unsafe { self.prepare(a, b, out, m, n, k, alpha, scales, bias, d_ld, beta) }?;
                 plans.entry(key).or_insert(plan)
             }
         };
-        unsafe { self.execute(&plan.desc, &plan.a, &plan.b, &plan.d, &plan.algo, a.0, b.0, out.0, alpha) }
+        unsafe { self.execute(&plan.desc, &plan.a, &plan.b, &plan.d, &plan.algo, a.0, b.0, out.0, alpha, beta) }
             .map_err(|e| blas(e, &format!("cublasLtMatmul {m}x{n}x{k} {:?}", a.1)))
     }
 
@@ -318,8 +326,8 @@ impl Lt {
         b: *const c_void,
         out: *mut c_void,
         alpha: f32,
+        beta: f32,
     ) -> Result<(), cudarc::cublaslt::result::CublasError> {
-        let beta = 0.0f32;
         unsafe {
             lt::matmul(
                 self.handle,
@@ -355,6 +363,8 @@ impl Lt {
         alpha: f32,
         scales: Option<(sys::cublasLtMatmulMatrixScale_t, *const c_void, *const c_void)>,
         bias: Option<*const c_void>,
+        d_ld: usize,
+        beta: f32,
     ) -> Result<Plan, CudaError> {
         let blas = |e: cudarc::cublaslt::result::CublasError, what: &str| CudaError::Blas(format!("{what}: {e:?}"));
         unsafe {
@@ -383,7 +393,7 @@ impl Lt {
             // B: the activations, [M, K] row-major = column-major [K, M] with ld = K.
             let b_layout = Layout(lt::create_matrix_layout(b.1, k as u64, m as u64, b.2).map_err(|e| blas(e, "B layout"))?);
             // D: [M, N] row-major = column-major [N, M] with ld = N.
-            let d_layout = Layout(lt::create_matrix_layout(out.1, n as u64, m as u64, n as i64).map_err(|e| blas(e, "D layout"))?);
+            let d_layout = Layout(lt::create_matrix_layout(out.1, n as u64, m as u64, d_ld as i64).map_err(|e| blas(e, "D layout"))?);
             let pref = Pref(lt::create_matmul_pref().map_err(|e| blas(e, "preference"))?);
             let workspace_bytes = WORKSPACE_BYTES;
             lt::set_matmul_pref_attribute(
@@ -438,18 +448,19 @@ impl Lt {
                     tracing::debug!("saved cuBLASLt algorithm for {key} no longer accepted; retuning");
                 }
             }
-            if !from_cache && self.autotune && self.tuning.load(Ordering::Relaxed) && m >= AUTOTUNE_MIN_ROWS && candidates.len() > 1 {
+            // (An accumulating call is never timed: each run would add to its output.)
+            if !from_cache && beta == 0.0 && self.autotune && self.tuning.load(Ordering::Relaxed) && m >= AUTOTUNE_MIN_ROWS && candidates.len() > 1 {
                 let ctx = self.stream.context();
                 let start = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
                 let end = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
                 let (mut best, mut first_ms) = (f32::INFINITY, 0.0f32);
                 for (i, candidate) in candidates.iter().enumerate() {
-                    if self.execute(&desc, &a_layout, &b_layout, &d_layout, candidate, a.0, b.0, out.0, alpha).is_err() {
+                    if self.execute(&desc, &a_layout, &b_layout, &d_layout, candidate, a.0, b.0, out.0, alpha, beta).is_err() {
                         continue; // a candidate the heuristic offered but the call rejects
                     }
                     start.record(&self.stream)?;
                     for _ in 0..2 {
-                        self.execute(&desc, &a_layout, &b_layout, &d_layout, candidate, a.0, b.0, out.0, alpha)
+                        self.execute(&desc, &a_layout, &b_layout, &d_layout, candidate, a.0, b.0, out.0, alpha, beta)
                             .map_err(|e| blas(e, "timing a candidate"))?;
                     }
                     end.record(&self.stream)?;
@@ -500,6 +511,8 @@ impl Lt {
                 w.decode / w.input_encode,
                 Some((mode, w_scale as *const c_void, x_scale_ptr as *const c_void)),
                 None,
+                n,
+                0.0,
             )
         }
     }
@@ -533,6 +546,8 @@ impl Lt {
                 1.0,
                 None,
                 None,
+                n,
+                0.0,
             )
         }
     }
@@ -565,6 +580,33 @@ impl Lt {
                 1.0,
                 None,
                 bias,
+                n,
+                0.0,
+            )
+        }
+    }
+
+    /// `out[m, n] (rows `out_ld` apart) = alpha · x[m, k] · w[n, k]^T`, added to what `out` holds when
+    /// `accumulate`, all bf16 with f32 accumulation and one rounding. `x` and `out` are raw addresses, so the
+    /// operands may be parts of wider buffers: Locate's low-rank updates read a layer's input and add to its
+    /// output in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bf16_into(&self, x: u64, w: &CudaSlice<u16>, n: usize, k: usize, out: u64, out_ld: usize, m: usize, alpha: f32, accumulate: bool) -> Result<(), CudaError> {
+        debug_assert!(w.len() >= n * k && out_ld >= n);
+        unsafe {
+            let (w_ptr, _r1) = w.device_ptr(&self.stream);
+            self.run(
+                (w_ptr as *const c_void, sys::cudaDataType_t::CUDA_R_16BF, k as i64),
+                (x as *const c_void, sys::cudaDataType_t::CUDA_R_16BF, k as i64),
+                (out as *mut c_void, sys::cudaDataType_t::CUDA_R_16BF),
+                m,
+                n,
+                k,
+                alpha,
+                None,
+                None,
+                out_ld,
+                if accumulate { 1.0 } else { 0.0 },
             )
         }
     }
@@ -587,6 +629,8 @@ impl Lt {
                 1.0,
                 None,
                 None,
+                n,
+                0.0,
             )
         }
     }

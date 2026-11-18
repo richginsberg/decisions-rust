@@ -68,13 +68,21 @@ fn error_text(error: PassError) -> String {
     error.to_string()
 }
 
+/// What a pass produced for one row: the probabilities of a decision sequence's questions, or the token spans of
+/// a locate sequence's.
+#[derive(Clone)]
+enum RowResult {
+    Probabilities(RowAnswers),
+    Spans(Vec<Vec<crate::locate::TokenSpan>>),
+}
+
 /// A request in the batcher: its rows, the answers so far, and where to send the response.
 struct Job {
     questions: Vec<(String, Question)>,
     rows: Vec<Encoded>,
     /// Estimated tokens, for backpressure (counted until `finish`).
     tokens: usize,
-    results: Vec<Option<RowAnswers>>,
+    results: Vec<Option<RowResult>>,
     remaining: usize,
     failed: bool,
     counted: bool,
@@ -225,10 +233,18 @@ impl Worker {
             .expect("pending is not empty");
         let (anchor_job, anchor_index) = self.pending.remove(first);
         let anchor = anchor_job.borrow().rows[anchor_index].length();
+        // A locate sequence runs in a pass of its own (the adapter is on for the whole pass), and never joins
+        // a pass of decision sequences.
+        let alone = anchor_job.borrow().rows[anchor_index].locate.is_some();
         let mut chosen = vec![(anchor_job, anchor_index)];
         let mut lengths = vec![anchor];
-        let mut rest: Vec<(usize, usize)> =
-            self.pending.iter().enumerate().map(|(i, (job, index))| (i, job.borrow().rows[*index].length())).collect();
+        let mut rest: Vec<(usize, usize)> = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, (job, index))| !alone && job.borrow().rows[*index].locate.is_none())
+            .map(|(i, (job, index))| (i, job.borrow().rows[*index].length()))
+            .collect();
         rest.sort_by_key(|&(i, length)| (length.abs_diff(anchor), i));
         let mut taken = Vec::new();
         for (i, length) in rest {
@@ -261,10 +277,13 @@ impl Worker {
             return;
         }
         let started = Instant::now();
-        let outcome = {
+        let outcome: Result<Vec<RowResult>, PassError> = {
             let borrowed: Vec<std::cell::Ref<Job>> = chosen.iter().map(|(job, _)| job.borrow()).collect();
             let rows: Vec<&Encoded> = borrowed.iter().zip(&chosen).map(|(job, (_, index))| &job.rows[*index]).collect();
-            self.batcher.model.run_pass(&rows)
+            match rows.as_slice() {
+                [row] if row.locate.is_some() => self.batcher.model.run_locate(row).map(|spans| vec![RowResult::Spans(spans)]),
+                _ => self.batcher.model.run_pass(&rows).map(|answers| answers.into_iter().map(RowResult::Probabilities).collect()),
+            }
         };
         match outcome {
             Ok(results) => {
@@ -319,7 +338,7 @@ impl Worker {
         });
     }
 
-    fn record(&self, (job, index): &(Shared, usize), result: RowAnswers) {
+    fn record(&self, (job, index): &(Shared, usize), result: RowResult) {
         let mut borrowed = job.borrow_mut();
         if borrowed.gone() {
             return;
@@ -342,14 +361,33 @@ impl Worker {
 
     fn decision(job: &Job) -> Result<Decision, Failure> {
         let mut by_key: std::collections::HashMap<&str, &Vec<f32>> = std::collections::HashMap::new();
+        let mut located: std::collections::HashMap<&str, Vec<crate::locate::Span>> = std::collections::HashMap::new();
         for (row, result) in job.rows.iter().zip(&job.results) {
-            let result = result.as_ref().expect("every row answered");
-            for (key, values) in row.keys.iter().zip(result) {
-                by_key.insert(key.as_str(), values);
+            match (result.as_ref().expect("every row answered"), &row.locate) {
+                (RowResult::Probabilities(result), None) => {
+                    for (key, values) in row.keys.iter().zip(result) {
+                        by_key.insert(key.as_str(), values);
+                    }
+                }
+                (RowResult::Spans(result), Some(plan)) if result.len() == row.keys.len() => {
+                    for (key, found) in row.keys.iter().zip(result) {
+                        if found.iter().any(|&(first, last, _)| first >= plan.offsets.len() || last >= plan.offsets.len()) {
+                            return Err(Failure::new(500, format!("a span outside the state for question {key}")));
+                        }
+                        located.insert(key.as_str(), crate::locate::spans(plan, found));
+                    }
+                }
+                _ => return Err(Failure::new(500, "a pass answered a row in the wrong form")),
             }
         }
+        // Answers in the request's question order, whichever pass produced them.
         let mut answers = Vec::with_capacity(job.questions.len());
         for (key, question) in &job.questions {
+            if question.is_locate() {
+                let spans = located.remove(key.as_str()).ok_or_else(|| Failure::new(500, format!("no answer for question {key}")))?;
+                answers.push((key.clone(), crate::protocol::Answer::Locate { spans }));
+                continue;
+            }
             let values = by_key.get(key.as_str()).ok_or_else(|| Failure::new(500, format!("no answer for question {key}")))?;
             answers.push((key.clone(), answer(question, values).map_err(Failure::from_protocol)?));
         }
@@ -366,7 +404,7 @@ impl Worker {
             self.batcher.model.run_pass(&[&borrowed.rows[*index]])
         };
         match outcome {
-            Ok(mut results) => self.record(item, results.remove(0)),
+            Ok(mut results) => self.record(item, RowResult::Probabilities(results.remove(0))),
             Err(error) => {
                 tracing::error!("Row of {} tokens failed alone: {error}", job.borrow().rows[*index].length());
                 Self::fail(job, Failure::from_pass(error));

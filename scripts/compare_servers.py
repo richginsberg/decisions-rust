@@ -58,12 +58,38 @@ def top(answer):
     return answer.get("choice") or max(answer["probabilities"], key=answer["probabilities"].get)
 
 
+LOCATE = {
+    "state": ("Invoice 4471 from Acme Corp is due on March 3. Contact Jane Doe (jane@acme.example) or Bob Li at "
+              "+1 555 0100. Ship to 12 Harbour Road, Leith; invoice 4460 was paid on 2026-01-17 by Globex GmbH."),
+    "questions": {"company": {"type": "locate", "instructions": "Company names"}, "person": {"type": "locate", "instructions": "Person names"},
+                  "date": {"type": "locate", "instructions": "Dates"}, "email": {"type": "locate"}},
+}
+
+
+def compare_locate(args):
+    """Spans are compared by position: the same (start, end) on both servers, and how far their scores are apart."""
+    reference, _ = ask(args.reference, args.key, LOCATE)
+    candidate, _ = ask(args.candidate, args.key, LOCATE)
+    for key in LOCATE["questions"]:
+        a = {(s["start"], s["end"]): s for s in reference["answers"][key]["spans"]}
+        b = {(s["start"], s["end"]): s for s in candidate["answers"][key]["spans"]}
+        both = sorted(set(a) & set(b))
+        shift = max((abs(a[k]["score"] - b[k]["score"]) for k in both), default=0.0)
+        print(f"locate {key}: {len(both)} spans on both, {len(set(a) - set(b))} only on the reference, "
+              f"{len(set(b) - set(a))} only on the candidate; scores differ by at most {shift:.3f}")
+        for k in sorted(set(a) ^ set(b)):
+            side, span = ("reference", a[k]) if k in a else ("candidate", b[k])
+            print(f"    only on the {side}: {span['text']!r} at {k[0]}-{k[1]}, score {span['score']:.3f}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("reference")
     parser.add_argument("candidate")
     parser.add_argument("--key", required=True)
     parser.add_argument("--image", action="append", default=[], help="PNG/JPEG file to include in an extra request")
+    parser.add_argument("--locate", action="store_true",
+                        help="also send a 'locate' request (v1.3 checkpoints with locate-span/) and compare the spans")
     args = parser.parse_args()
 
     requests = [{"state": state, "questions": QUESTIONS} for state in STATES]
@@ -74,6 +100,9 @@ def main():
                 mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
                 images.append(f"data:{mime};base64," + base64.b64encode(f.read()).decode())
         requests.append({"state": "Describe what the picture shows and classify it.", "questions": QUESTIONS, "images": images})
+
+    if args.locate:
+        compare_locate(args)
 
     largest, total, count, changed = 0.0, 0.0, 0, 0
     for body in requests:

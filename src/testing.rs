@@ -16,6 +16,8 @@ pub const WORD_PAD: u32 = 0;
 pub const WORD_MARKER: u32 = 1;
 pub const WORD_IMAGE_PAD: u32 = 2;
 pub const WORD_SEPARATOR: u32 = 3;
+/// The Locate marker's id in the word tokenizer's fake model (never produced from text).
+pub const WORD_LOCATE: u32 = 4;
 
 impl WordTokenizer {
     pub fn id_of(token: &str) -> u32 {
@@ -30,26 +32,44 @@ impl WordTokenizer {
                 for byte in token.bytes() {
                     hash = (hash ^ byte as u32).wrapping_mul(16777619);
                 }
-                4 + hash % 1_000_000
+                5 + hash % 1_000_000
             }
         }
     }
 
     /// Split into words, with each `<|...|>` as its own token even when glued to its neighbours.
     pub fn split(text: &str) -> Vec<String> {
+        Self::split_offsets(text).into_iter().map(|(token, _)| token).collect()
+    }
+
+    /// The same tokens with the characters (start, end exclusive) each covers.
+    pub fn split_offsets(text: &str) -> Vec<(String, (usize, usize))> {
+        let chars: Vec<char> = text.chars().collect();
         let mut tokens = Vec::new();
-        let mut rest = text;
-        while !rest.is_empty() {
-            if let Some(start) = rest.find("<|") {
-                if let Some(end) = rest[start..].find("|>") {
-                    tokens.extend(rest[..start].split_whitespace().map(str::to_string));
-                    tokens.push(rest[start..start + end + 2].to_string());
-                    rest = &rest[start + end + 2..];
-                    continue;
-                }
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_whitespace() {
+                i += 1;
+                continue;
             }
-            tokens.extend(rest.split_whitespace().map(str::to_string));
-            break;
+            let special = |at: usize| -> Option<usize> {
+                if chars[at] != '<' || chars.get(at + 1) != Some(&'|') {
+                    return None;
+                }
+                (at + 2..chars.len().saturating_sub(1)).find(|&j| chars[j] == '|' && chars[j + 1] == '>').map(|j| j + 2)
+            };
+            let end = match special(i) {
+                Some(end) => end,
+                None => {
+                    let mut j = i;
+                    while j < chars.len() && !chars[j].is_whitespace() && (j == i || special(j).is_none()) {
+                        j += 1;
+                    }
+                    j
+                }
+            };
+            tokens.push((chars[i..end].iter().collect(), (i, end)));
+            i = end;
         }
         tokens
     }
@@ -61,6 +81,9 @@ impl Tokenize for WordTokenizer {
     }
     fn token_to_id(&self, token: &str) -> Option<u32> {
         Some(Self::id_of(token))
+    }
+    fn encode_offsets(&self, text: &str) -> Result<Vec<(u32, (usize, usize))>, ProtocolError> {
+        Ok(Self::split_offsets(text).into_iter().map(|(token, span)| (Self::id_of(&token), span)).collect())
     }
 }
 
@@ -81,7 +104,8 @@ pub fn word_encoder_with(codes: Vec<String>) -> Encoder {
 }
 
 pub fn fake_model(budget: Budget, seconds_per_token: f64) -> Arc<FakeModel> {
-    Arc::new(FakeModel { encoder: word_encoder(), budget, seconds_per_token, passes: parking_lot::Mutex::new(Vec::new()) })
+    let locate = crate::locate::LocateEncoder::new(Box::new(WordTokenizer), word_encoder().codes().to_vec(), WORD_PAD, 2, WORD_LOCATE).expect("locate encoder");
+    Arc::new(FakeModel { encoder: word_encoder(), budget, seconds_per_token, passes: parking_lot::Mutex::new(Vec::new()), locate: Some(locate) })
 }
 
 /// A ready service around the fake model, its batcher started.

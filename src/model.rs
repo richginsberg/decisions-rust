@@ -66,6 +66,14 @@ pub trait Model: Send + Sync {
     /// One forward pass over sequences, one result per row in order. Rows are independent, so each gets
     /// the answers it would get alone.
     fn run_pass(&self, rows: &[&Encoded]) -> Result<Vec<RowAnswers>, PassError>;
+    /// The encoder of `"locate"` questions, when the checkpoint has the Locate adapter.
+    fn locate(&self) -> Option<&crate::locate::LocateEncoder> {
+        None
+    }
+    /// The Locate pass of one locate sequence (see `crate::locate`): each question's token spans.
+    fn run_locate(&self, _row: &Encoded) -> Result<Vec<Vec<crate::locate::TokenSpan>>, PassError> {
+        Err(PassError::Request("'locate' questions need a checkpoint with a locate-span/ adapter".into()))
+    }
     /// The last pass's per-stage timing, when profiling is on (see DECISION_PROFILE).
     fn last_profile(&self) -> Option<String> {
         None
@@ -81,6 +89,8 @@ pub struct FakeModel {
     pub budget: Budget,
     pub seconds_per_token: f64,
     pub passes: parking_lot::Mutex<Vec<Vec<Vec<u32>>>>,
+    /// The fake Locate adapter's encoder (`None`: a checkpoint without one).
+    pub locate: Option<crate::locate::LocateEncoder>,
 }
 
 impl FakeModel {
@@ -128,6 +138,21 @@ impl Model for FakeModel {
             mean: [0.5; 3],
             std: [0.5; 3],
         }
+    }
+    fn locate(&self) -> Option<&crate::locate::LocateEncoder> {
+        self.locate.as_ref()
+    }
+    /// One span per question: question i gets the state's token i (wrapping) and the next, with score 0.75.
+    fn run_locate(&self, row: &Encoded) -> Result<Vec<Vec<crate::locate::TokenSpan>>, PassError> {
+        let Some(plan) = &row.locate else {
+            return Err(PassError::Internal("not a locate sequence".into()));
+        };
+        if row.input_ids.contains(&u32::MAX) {
+            return Err(PassError::Request("an invalid question".into()));
+        }
+        self.passes.lock().push(vec![row.input_ids.clone()]);
+        let tokens = plan.positions.len();
+        Ok((0..row.markers.len()).map(|i| if tokens == 0 { Vec::new() } else { vec![(i % tokens, (i % tokens + 1).min(tokens - 1), 0.75)] }).collect())
     }
     fn run_pass(&self, rows: &[&Encoded]) -> Result<Vec<RowAnswers>, PassError> {
         for row in rows {

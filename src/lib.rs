@@ -10,6 +10,7 @@ pub mod api;
 pub mod batcher;
 pub mod config;
 pub mod images;
+pub mod locate;
 pub mod model;
 pub mod protocol;
 pub mod testing;

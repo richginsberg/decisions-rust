@@ -258,6 +258,24 @@ extern "C" __global__ void silu_mul_fp4(const bf16* __restrict__ gate_up, uint8_
     }
 }
 
+// The merged gate/up output [rows, 2n] bf16 -> silu(gate) * up [rows, n] in bf16 (rounded as `silu_mul_fp4`
+// rounds before it quantizes). Locate needs the product itself: the down projection's LoRA reads it.
+extern "C" __global__ void silu_mul(const bf16* __restrict__ gate_up, bf16* __restrict__ out, uint32_t n, uint32_t rows) {
+    const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i >= (size_t)rows * n) return;
+    const size_t row = i / n, col = i % n;
+    const bf16* g = gate_up + row * 2 * n + col;
+    const uint4 graw = *reinterpret_cast<const uint4*>(g);
+    const uint4 uraw = *reinterpret_cast<const uint4*>(g + n);
+    const bf16* gp = reinterpret_cast<const bf16*>(&graw);
+    const bf16* up = reinterpret_cast<const bf16*>(&uraw);
+    uint4 packed;
+    bf16* op = reinterpret_cast<bf16*>(&packed);
+#pragma unroll
+    for (int e = 0; e < 8; e++) op[e] = f2bf(round_bf16(silu(bf2f(gp[e]))) * bf2f(up[e]));
+    *reinterpret_cast<uint4*>(out + i) = packed;
+}
+
 // The per-tensor FP8 matmul's f32 accumulator [rows, n] times row_scale[row] * col_scale[col], rounded once to
 // bf16: what torch._scaled_mm's rowwise mode produces. (cuBLASLt applies outer-vector FP8 scales on Hopper only;
 // Blackwell runs the scalar-scaled matmul and this kernel finishes it.)

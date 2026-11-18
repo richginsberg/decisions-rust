@@ -150,3 +150,88 @@ async fn images_are_accepted_when_valid() {
     // 64x64 is scaled up to the minimum 65,536 pixels: 256x256 = 16x16 patches, merged 2x2 = 64 image tokens.
     assert!(response["usage"]["input_tokens"].as_u64().unwrap() > 64);
 }
+
+// ------------------------------------------------------------------------------------------- locate
+
+/// A model without the Locate adapter (a v1.2 checkpoint, or one with no locate-span/).
+fn app_without_locate() -> axum::Router {
+    use decisions_rust_nvfp4::model::FakeModel;
+    use decisions_rust_nvfp4::testing::word_encoder;
+    let model = std::sync::Arc::new(FakeModel {
+        encoder: word_encoder(),
+        budget: Budget { max_tokens: 4000, max_rows: 8, packed: true },
+        seconds_per_token: 0.0,
+        passes: parking_lot::Mutex::new(Vec::new()),
+        locate: None,
+    });
+    router(fake_service(model, Some(KEY)))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locate_answers_with_spans_of_the_state() {
+    let app = app();
+    let state = "Zoë paid Acme Corp on March 3.";
+    let body = json!({"state": state, "questions": {"company": {"type": "locate"}, "date": {"type": "locate", "instructions": "Dates"}}});
+    let (status, _, response) = call(&app, "POST", "/v1/decisions", Some(KEY), Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let chars: Vec<char> = state.chars().collect();
+    for key in ["company", "date"] {
+        let answer = &response["answers"][key];
+        assert_eq!(answer["type"], "locate");
+        let spans = answer["spans"].as_array().unwrap();
+        assert_eq!(spans.len(), 1, "{answer}");
+        // Offsets are characters of the state, end exclusive, and `text` is that slice.
+        let (start, end) = (spans[0]["start"].as_u64().unwrap() as usize, spans[0]["end"].as_u64().unwrap() as usize);
+        assert_eq!(spans[0]["text"], chars[start..end].iter().collect::<String>());
+        assert_eq!(spans[0]["score"], 0.75);
+    }
+    // The fake adapter gives question i the state's tokens i and i + 1: "Zoë paid", then "paid Acme".
+    assert_eq!(response["answers"]["company"]["spans"][0]["text"], "Zoë paid");
+    assert_eq!(response["answers"]["date"]["spans"][0]["text"], "paid Acme");
+    // Both questions share one sequence.
+    assert_eq!(response["usage"]["sequences"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locate_mixes_with_decision_questions_in_request_order() {
+    let app = app();
+    let mut body = decision();
+    body["questions"] = json!({
+        "who": {"type": "locate", "instructions": "Who wrote this?"},
+        "churn_risk": {"type": "noul", "instructions": "Does the customer threaten to cancel or leave?"},
+        "amounts": {"type": "locate"},
+        "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["not urgent", "soon", "blocking"]}});
+    let (status, _, response) = call(&app, "POST", "/v1/decisions", Some(KEY), Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let answers = response["answers"].as_object().unwrap();
+    assert_eq!(answers.keys().collect::<Vec<_>>(), vec!["who", "churn_risk", "amounts", "urgency"]);
+    assert_eq!((answers["who"]["type"].as_str(), answers["churn_risk"]["type"].as_str()), (Some("locate"), Some("noul")));
+    assert_eq!((answers["amounts"]["type"].as_str(), answers["urgency"]["type"].as_str()), (Some("locate"), Some("score")));
+    // One joint decision sequence (the fake model serves protocol version 3) and one locate sequence.
+    assert_eq!(response["usage"]["sequences"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locate_refusals() {
+    let app = app();
+    let locate = |state: Value| json!({"state": state, "questions": {"q": {"type": "locate"}}});
+    for (body, message) in [
+        (locate(json!({"a": 1})), "Locate requires text state, no images, and at most 128 questions"),
+        (locate(json!("")), "Locate state must contain text"),
+        (json!({"state": "text", "questions": {"it's": {"type": "locate", "instructions": {"a": 1}}}}), "Question \"it's\": Locate instructions must be text or null"),
+    ] {
+        let (status, _, response) = call(&app, "POST", "/v1/decisions", Some(KEY), Some(body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+        assert_eq!(response["detail"], message);
+    }
+    // A locate question has no criteria.
+    let (status, _, _) = call(&app, "POST", "/v1/decisions", Some(KEY), Some(json!({"state": "text", "questions": {"q": {"type": "locate", "criteria": {"a": "b"}}}}))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    // A checkpoint without the adapter refuses locate questions, and still answers the others.
+    let plain = app_without_locate();
+    let (status, _, response) = call(&plain, "POST", "/v1/decisions", Some(KEY), Some(locate(json!("text")))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response["detail"], "'locate' questions need a checkpoint with a locate-span/ adapter");
+    let (status, _, _) = call(&plain, "POST", "/v1/decisions", Some(KEY), Some(decision())).await;
+    assert_eq!(status, StatusCode::OK);
+}

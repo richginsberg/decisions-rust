@@ -46,7 +46,20 @@ __device__ __forceinline__ void ldmatrix_x2_trans(uint32_t* r, const bf16* p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(s));
 }
 
-template <int D, int DREAL, bool GATED>
+// A tile of the isolated-question layout (Locate): up to 128 queries starting at token `q_start`, attending two
+// key ranges, the context and the query's own question block (`k2_len` = 0 for one range).
+struct AttnSplitTile {
+    uint32_t q_start; // first query token, absolute
+    uint32_t q_len;   // queries of the tile (0: a padding entry)
+    uint32_t k1_start;
+    uint32_t k1_len;
+    uint32_t k2_start;
+    uint32_t k2_len;
+};
+
+// SPLIT: `tiles` are AttnSplitTile (cast from the pointer); otherwise AttnTile, whose queries and keys are one
+// sequence.
+template <int D, int DREAL, bool GATED, bool SPLIT>
 __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* __restrict__ q, const bf16* __restrict__ k,
                                const bf16* __restrict__ v, const bf16* __restrict__ gate, bf16* __restrict__ out,
                                uint32_t q_stride, uint32_t kv_stride, uint32_t gate_stride, uint32_t gate_head_stride,
@@ -58,21 +71,33 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
     extern __shared__ __align__(16) unsigned char attn_smem[];
     bf16* smem = reinterpret_cast<bf16*>(attn_smem);
 
-    const AttnTile tile = tiles[blockIdx.x];
-    if (tile.seq_len == 0) return; // a padding entry of a fixed-size tile table (the whole block leaves)
+    // The tile as queries q_base .. q_base + q_count and keys k1 then k2 (padding entries leave as a block).
+    uint32_t q_base, q_count, k1_start, k1_len, k2_start, k2_len;
+    if (SPLIT) {
+        const AttnSplitTile split = reinterpret_cast<const AttnSplitTile*>(tiles)[blockIdx.x];
+        if (split.q_len == 0) return;
+        q_base = split.q_start; q_count = split.q_len;
+        k1_start = split.k1_start; k1_len = split.k1_len; k2_start = split.k2_start; k2_len = split.k2_len;
+    } else {
+        const AttnTile tile = tiles[blockIdx.x];
+        if (tile.seq_len == 0) return; // a padding entry of a fixed-size tile table
+        q_base = tile.seq_start + tile.q_start; q_count = tile.seq_len - tile.q_start;
+        k1_start = tile.seq_start; k1_len = tile.seq_len; k2_start = 0; k2_len = 0;
+    }
+    const uint32_t n_keys = k1_len + k2_len;
     const uint32_t head = blockIdx.y;
     const uint32_t kv_head = head / (heads / kv_heads);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    const uint32_t row0 = tile.q_start + warp * 16;
+    const uint32_t row0 = warp * 16; // this warp's first query, relative to q_base
     // A warp whose 16 rows all lie beyond the sequence still runs the loop (it shares the block's barriers);
     // its rows read row 0 and store nothing.
 
     // Q fragments for this warp's 16 rows, straight from global memory.
     uint32_t qa[KSTEPS][4];
     {
-        const uint32_t r_lo = min(row0 + g, tile.seq_len - 1), r_hi = min(row0 + g + 8, tile.seq_len - 1);
-        const bf16* q_lo = q + (size_t)(tile.seq_start + r_lo) * q_stride + head * DREAL;
-        const bf16* q_hi = q + (size_t)(tile.seq_start + r_hi) * q_stride + head * DREAL;
+        const uint32_t r_lo = min(row0 + g, q_count - 1), r_hi = min(row0 + g + 8, q_count - 1);
+        const bf16* q_lo = q + (size_t)(q_base + r_lo) * q_stride + head * DREAL;
+        const bf16* q_hi = q + (size_t)(q_base + r_hi) * q_stride + head * DREAL;
 #pragma unroll
         for (int s = 0; s < KSTEPS; s++) {
             const int c0 = s * 16 + 2 * t, c1 = c0 + 8;
@@ -91,8 +116,10 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
         bf16* vd = kd + KEYS * PAD;
         for (int i = threadIdx.x; i < KEYS * (D / 8); i += THREADS) {
             const int key = i / (D / 8), d = (i % (D / 8)) * 8;
-            const bool ok = key0 + key < tile.seq_len && d < DREAL;
-            const size_t base = ok ? (size_t)(tile.seq_start + key0 + key) * kv_stride + kv_head * DREAL + d : (size_t)tile.seq_start * kv_stride;
+            const uint32_t index = key0 + key; // among the tile's keys: k1, then k2
+            const bool ok = index < n_keys && d < DREAL;
+            const uint32_t token = index < k1_len ? k1_start + index : k2_start + (index - k1_len);
+            const size_t base = ok ? (size_t)token * kv_stride + kv_head * DREAL + d : (size_t)k1_start * kv_stride;
             cp_async16(kd + key * PAD + d, k + base, ok ? 16 : 0);
             cp_async16(vd + key * PAD + d, v + base, ok ? 16 : 0);
         }
@@ -103,7 +130,7 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
     for (int n = 0; n < NTILES; n++) { o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f; }
     float m_lo = -INFINITY, m_hi = -INFINITY, l_lo = 0.f, l_hi = 0.f;
 
-    const uint32_t iters = (tile.seq_len + KEYS - 1) / KEYS;
+    const uint32_t iters = (n_keys + KEYS - 1) / KEYS;
     issue(0);
     cp_async_commit();
     for (uint32_t it = 0; it < iters; it++) {
@@ -135,7 +162,7 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
         }
 
         // Online softmax over the 32 keys, per row (rows g and g+8 of the warp's 16).
-        const uint32_t valid = tile.seq_len - key0; // keys with index < valid are real
+        const uint32_t valid = n_keys - key0; // keys with index < valid are real
         float rmax_lo = -INFINITY, rmax_hi = -INFINITY;
 #pragma unroll
         for (int n = 0; n < KEYS / 8; n++) {
@@ -206,8 +233,8 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
     for (int n = 0; n < NTILES; n++) {
         const int d = n * 8 + 2 * t;
         if (d >= DREAL) continue;
-        if (r_lo < tile.seq_len) {
-            const size_t tok = tile.seq_start + r_lo;
+        if (r_lo < q_count) {
+            const size_t tok = q_base + r_lo;
             float a = o[n][0] * inv_lo, b = o[n][1] * inv_lo;
             if (GATED) {
                 const bf16* gp = gate + tok * gate_stride + head * gate_head_stride + d;
@@ -216,8 +243,8 @@ __device__ void attention_impl(const AttnTile* __restrict__ tiles, const bf16* _
             }
             *reinterpret_cast<uint32_t*>(out + tok * out_stride + head * DREAL + d) = pack_bf16(a, b);
         }
-        if (r_hi < tile.seq_len) {
-            const size_t tok = tile.seq_start + r_hi;
+        if (r_hi < q_count) {
+            const size_t tok = q_base + r_hi;
             float a = o[n][2] * inv_hi, b = o[n][3] * inv_hi;
             if (GATED) {
                 const bf16* gp = gate + tok * gate_stride + head * gate_head_stride + d;
@@ -240,12 +267,21 @@ extern "C" __global__ void attention(const AttnTile* __restrict__ tiles, const b
                                      const bf16* __restrict__ v, const bf16* __restrict__ gate, bf16* __restrict__ out,
                                      uint32_t q_stride, uint32_t kv_stride, uint32_t gate_stride, uint32_t gate_head_stride,
                                      uint32_t out_stride, uint32_t heads, uint32_t kv_heads, float scale_log2) {
-    attention_impl<256, 256, true>(tiles, q, k, v, gate, out, q_stride, kv_stride, gate_stride, gate_head_stride, out_stride, heads, kv_heads, scale_log2);
+    attention_impl<256, 256, true, false>(tiles, q, k, v, gate, out, q_stride, kv_stride, gate_stride, gate_head_stride, out_stride, heads, kv_heads, scale_log2);
 }
 
 // Vision attention: head_dim 72, q/k/v inside the qkv matmul output [N, 3, 16, 72] (q_stride = kv_stride = 3456).
 extern "C" __global__ void vision_attention(const AttnTile* __restrict__ tiles, const bf16* __restrict__ q, const bf16* __restrict__ k,
                                             const bf16* __restrict__ v, bf16* __restrict__ out, uint32_t qkv_stride,
                                             uint32_t out_stride, uint32_t heads, float scale_log2) {
-    attention_impl<80, 72, false>(tiles, q, k, v, nullptr, out, qkv_stride, qkv_stride, 0, 0, out_stride, heads, heads, scale_log2);
+    attention_impl<80, 72, false, false>(tiles, q, k, v, nullptr, out, qkv_stride, qkv_stride, 0, 0, out_stride, heads, heads, scale_log2);
+}
+
+// Text attention over split tiles (the isolated-question layout of Locate): `tiles` are AttnSplitTile.
+extern "C" __global__ void attention_split(const AttnSplitTile* __restrict__ tiles, const bf16* __restrict__ q, const bf16* __restrict__ k,
+                                           const bf16* __restrict__ v, const bf16* __restrict__ gate, bf16* __restrict__ out,
+                                           uint32_t q_stride, uint32_t kv_stride, uint32_t gate_stride, uint32_t gate_head_stride,
+                                           uint32_t out_stride, uint32_t heads, uint32_t kv_heads, float scale_log2) {
+    attention_impl<256, 256, true, true>(reinterpret_cast<const AttnTile*>(tiles), q, k, v, gate, out, q_stride, kv_stride, gate_stride,
+                                         gate_head_stride, out_stride, heads, kv_heads, scale_log2);
 }

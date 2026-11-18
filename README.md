@@ -16,6 +16,7 @@ tensor-core paths as before.
 | Path | What |
 |---|---|
 | `src/protocol.rs` | The joint prompt, tokenization and answers, token for token as pplx_decider's `protocol.py`, in both protocol versions (3: v1.2, 4: v1.3) |
+| `src/locate.rs` | The `locate` question type on the CPU: request rules, the prompt and its token offsets, the span head's scoring, span clean-up (pplx_decider's `locate.py`) |
 | `src/api.rs` | autojev's HTTP contract: routes, Bearer auth, request and response shape, error codes |
 | `src/batcher.rs` | Continuous batching in front of the GPU thread |
 | `src/model.rs` | What the server needs from a model; a CPU fake for the tests |
@@ -26,6 +27,7 @@ tensor-core paths as before.
 | `src/cuda/device.rs` | Weights onto the device (FP4 scales re-tiled, gate/up merged, linear-attention projections to FP8), the workspace, the `Model` |
 | `src/cuda/forward.rs` | The text backbone over packed sequences and the readout |
 | `src/cuda/vision.rs` | The vision tower: patches to text-space embeddings |
+| `src/cuda/locate.rs` | (feature `cuda`) The Locate adapter's weights and its forward pass: low-rank updates beside every matmul, isolated question blocks |
 | `src/cuda/kernels.rs` | The fatbin and typed launchers for every kernel |
 | `kernels/quant.cu` | NVFP4 / FP8 activation quantization fused with the RMSNorm, residual add and SiLU-gate that feed it |
 | `kernels/attention.cu` | Non-causal attention on the tensor cores (bf16 `mma.sync`, online softmax), text and vision |
@@ -34,6 +36,7 @@ tensor-core paths as before.
 | `Dockerfile`, `scripts/start.sh`, `scripts/fetch_model.py` | The image: build with the CUDA toolkit, run on the CUDA runtime, fetch the checkpoint to the volume |
 | `scripts/compare_servers.py` | Send the same decisions to the Python and Rust servers and compare their probabilities |
 | `fixtures/encoder.json` | What the Python encoder produced for 156 requests (`scripts/make_encoder_fixture.py`) |
+| `fixtures/locate.json` | What v1.3's own `locate.py` produced for 20 requests: rules, prompts, token offsets, 1,109 spans (`scripts/make_locate_fixture.py`) |
 | `fixtures/encoder_v4.json` | What v1.3's own `protocol.py` produced for 162 requests, 353 sequences, with real images (`scripts/make_encoder_fixture_v4.py`) |
 
 ## Building and testing without a GPU
@@ -65,8 +68,37 @@ model, kernels and HTTP contract are the same for both. Anything else is refused
 
 Under version 4 every answer is independent of the request's other questions, and a request of Q questions
 runs its state Q times, so many-question requests over long states cost more than under version 3. Not
-implemented from v1.3: the `isolated` multi-question layout and the `locate-span` adapter. Switch checkpoints
-with `DECISION_MODEL_ID` and `DECISION_MODEL_REVISION`; the tuned-algorithm cache is per checkpoint directory.
+implemented from v1.3: the `isolated` layout for decision questions. Switch checkpoints with `DECISION_MODEL_ID`
+and `DECISION_MODEL_REVISION`; the tuned-algorithm cache is per checkpoint directory.
+
+## Locate questions
+
+A version 4 checkpoint with a `locate-span/` folder (pplx-decider v1.3) also answers `"locate"` questions:
+`{"type": "locate", "instructions": "Person names"}` returns the spans of the state that match the label (the
+instructions, or the question's key without them):
+
+```json
+{"type": "locate", "spans": [{"start": 53, "end": 61, "text": "Jane Doe", "score": 0.93}]}
+```
+
+`start` and `end` are character offsets into `state` (Unicode code points, end exclusive), spans are sorted by
+position, and a span is kept when its probability reaches the adapter's cutoff (0.5). The rules are
+pplx_decider's: a text state, no images, at most 128 questions in the request, text or null instructions.
+Locate and decision questions mix in one request; answers come back in the request's order.
+
+How it runs: every locate question of a request shares one sequence (the context, then a block per question,
+split in halves only over the length limit), in a pass of its own with the adapter on. The adapter is a rank-64
+update on every linear layer of the language model, applied in bf16 beside each quantized matmul, plus a trained
+embedding for the `<|locate|>` marker; question blocks are isolated from each other in attention and in the
+delta rule's state. A locate pass runs eagerly, one sequence at a time, with about twenty extra small
+matmuls per layer, so it costs more than a decision pass of its length (not yet measured). The adapter takes about 1 GB of GPU memory and loads at startup after the model; if it fails to
+load or its startup check fails, the server logs why and serves decisions without it. `DECISION_LOCATE=0` leaves
+it out; low memory mode and version 3 checkpoints never load it, and locate questions then get a 422.
+
+Two differences from the reference: the base model is the NVFP4 quantization of the one the adapter was trained
+on (the reference runs Locate only on its full-precision path), so scores near the cutoff can fall either side;
+and the file hashes the adapter records for its base are not enforced, since quantization changes `config.json`.
+`scripts/compare_servers.py --locate` compares the two servers' spans.
 
 ## Building with the GPU
 
@@ -114,6 +146,7 @@ buckets warmed at load (to 4096 tokens), instead of some 700 kernel launches; 0 
 loads, for cold volumes; 0 disables.
 `DECISION_TUNING_CACHE` (`<checkpoint>/.decision-tuning`): where the tuned cuBLASLt algorithms are kept between
 runs, per GPU and cuBLASLt version, so only the first start on a volume pays the tuning; empty disables.
+`DECISION_LOCATE` (1): load the checkpoint's `locate-span/` adapter and answer `locate` questions; 0 leaves it out.
 `DECISION_PROFILE` (0): with 1, every pass stage is timed (a stream sync after each) and reported in the
 `server-timing` response header and the log; for profiling only, since the syncs slow passes down.
 

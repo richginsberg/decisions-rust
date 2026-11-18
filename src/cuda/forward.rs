@@ -158,7 +158,7 @@ pub fn run(engine: &mut Engine, checkpoint: &Checkpoint, rows: &[&Encoded]) -> R
     let mut timer = Timer::new(engine.profile, &stream);
     let eps = text.rms_norm_eps as f32;
     let hidden = text.hidden_size;
-    let Engine { stream: _, lt, kernels, weights, workspace: ws, profile, last_profile, graphs } = engine;
+    let Engine { stream: _, lt, kernels, weights, workspace: ws, profile, last_profile, graphs, .. } = engine;
 
     upload(&stream, ws, &pack, &counts)?;
     timer.tick("inputs");
@@ -366,7 +366,7 @@ pub fn capture(engine: &mut Engine, checkpoint: &Checkpoint, rows: usize) -> Res
     let text = &checkpoint.model.text_config;
     let counts = Counts::of(rows, engine.workspace.max_seqs);
     let stream = engine.stream.clone();
-    let Engine { stream: _, lt, kernels, weights, workspace: ws, profile: _, last_profile: _, graphs } = engine;
+    let Engine { stream: _, lt, kernels, weights, workspace: ws, graphs, .. } = engine;
     let Embeddings::Device(table) = &weights.embeddings else {
         return Ok(());
     };
@@ -426,7 +426,7 @@ fn engine_image_pad(checkpoint: &Checkpoint) -> u32 {
 /// One NVFP4 projection of the normed input, quantizing it first unless the previous projection already did
 /// with the same input scale.
 #[allow(clippy::too_many_arguments)]
-fn fp4_project(
+pub(super) fn fp4_project(
     kernels: &super::kernels::Kernels,
     lt: &super::blas::Lt,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn pack_lays_rows_end_to_end_with_image_positions() {
         let pad = 7;
-        let a = Encoded { keys: vec!["q".into()], counts: vec![2], input_ids: vec![1, 2, 3], markers: vec![2], images: vec![], pixels: vec![] };
+        let a = Encoded { keys: vec!["q".into()], counts: vec![2], input_ids: vec![1, 2, 3], markers: vec![2], images: vec![], pixels: vec![], locate: None };
         // 4x4 patch grid = 2x2 merged = 4 image tokens between two text tokens.
         let image = crate::images::PreparedImage { grid: ImageGrid { t: 1, h: 4, w: 4 }, patches: vec![] };
         let b = Encoded {
@@ -473,6 +473,7 @@ mod tests {
             markers: vec![6],
             images: vec![image.grid],
             pixels: vec![std::sync::Arc::new(image)],
+            locate: None,
         };
         let pack = Pack::build(&[&a, &b], pad, 2).unwrap();
         assert_eq!(pack.n, 10);

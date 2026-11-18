@@ -115,6 +115,31 @@ extern "C" __global__ void conv1d_silu_scaled(const float* __restrict__ acc, con
     }
 }
 
+// The same conv with each token's three predecessors given by index (`sources` [n][3]: the tokens at -3, -2 and
+// -1, or -1 for none). Locate's isolated questions use it: a question block's first tokens follow the context's
+// last ones, not the previous block's.
+extern "C" __global__ void conv1d_silu_indexed(const bf16* __restrict__ x, const bf16* __restrict__ w, const int32_t* __restrict__ sources,
+                                               bf16* __restrict__ y, uint32_t n, uint32_t c) {
+    const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i >= (size_t)n * c) return;
+    const uint32_t tok = i / c, ch = i % c;
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int32_t src = j == 3 ? (int32_t)tok : sources[(size_t)tok * 3 + j];
+        if (src < 0) continue;
+        const uint4 raw = *reinterpret_cast<const uint4*>(x + (size_t)src * c + ch);
+        const bf16* xp = reinterpret_cast<const bf16*>(&raw);
+#pragma unroll
+        for (int e = 0; e < 8; e++) acc[e] += bf2f(xp[e]) * bf2f(w[(size_t)(ch + e) * 4 + j]);
+    }
+    uint4 out;
+    bf16* op = reinterpret_cast<bf16*>(&out);
+#pragma unroll
+    for (int e = 0; e < 8; e++) op[e] = f2bf(silu(round_bf16(acc[e])));
+    *reinterpret_cast<uint4*>(y + i) = out;
+}
+
 extern "C" __global__ void conv1d_silu(const bf16* __restrict__ x, const bf16* __restrict__ w, const int32_t* __restrict__ seq_of,
                                        bf16* __restrict__ y, uint32_t n, uint32_t c) {
     const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;

@@ -58,21 +58,34 @@ pub enum Question {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instructions: Option<Content>,
     },
+    /// Extract the spans of the state that match the question's key, or its `instructions` when given. Answered
+    /// by the Locate adapter (see `crate::locate`), not by the readout: it has no options.
+    Locate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<Content>,
+    },
 }
 
 impl Question {
     pub fn instructions(&self) -> Option<&Content> {
         match self {
-            Question::Choice { instructions, .. } | Question::Score { instructions, .. } | Question::Noul { instructions, .. } => {
+            Question::Choice { instructions, .. }
+            | Question::Score { instructions, .. }
+            | Question::Noul { instructions, .. }
+            | Question::Locate { instructions } => {
                 instructions.as_ref()
             }
         }
+    }
+    pub fn is_locate(&self) -> bool {
+        matches!(self, Question::Locate { .. })
     }
     pub fn kind(&self) -> &'static str {
         match self {
             Question::Choice { .. } => "choice",
             Question::Score { .. } => "score",
             Question::Noul { .. } => "noul",
+            Question::Locate { .. } => "locate",
         }
     }
 }
@@ -101,7 +114,7 @@ pub enum ProtocolError {
 
 // ---------------------------------------------------------------------------------------------- Python's json.dumps
 
-fn python_isspace(c: char) -> bool {
+pub fn python_isspace(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\x0b' | '\x0c' | '\r' | '\x1c'..='\x1f' | ' ' | '\u{85}' | '\u{a0}' | '\u{1680}'
         | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}')
 }
@@ -261,6 +274,7 @@ pub fn options(question: &Question) -> (Vec<String>, Vec<String>) {
             };
             (vec!["false".into(), "true".into()], vec![text("false", "No / false"), text("true", "Yes / true")])
         }
+        Question::Locate { .. } => (Vec::new(), Vec::new()),
     }
 }
 
@@ -282,6 +296,8 @@ pub enum Answer {
     Choice { probabilities: serde_json::Map<String, Value>, choice: String, confidence: f64 },
     Noul { noul: f64 },
     Score { probabilities: serde_json::Map<String, Value>, legend: serde_json::Map<String, Value>, score: f64, confidence: f64 },
+    /// Spans of the state, sorted by position; empty if nothing matches.
+    Locate { spans: Vec<crate::locate::Span> },
 }
 
 fn number(value: f64) -> Value {
@@ -290,6 +306,9 @@ fn number(value: f64) -> Value {
 
 /// Decisions-API answer for one question from its probabilities over the valid options (protocol.py's `answer`).
 pub fn answer(question: &Question, probabilities: &[f32]) -> Result<Answer, ProtocolError> {
+    if question.is_locate() {
+        return Err(ProtocolError::Internal("A locate question is answered from spans, not probabilities".into()));
+    }
     let (keys, descriptions) = options(question);
     let values: Vec<f64> = probabilities.iter().map(|&p| p as f64).collect();
     if values.len() != keys.len() || values.is_empty() {
@@ -325,7 +344,7 @@ pub fn answer(question: &Question, probabilities: &[f32]) -> Result<Answer, Prot
                 confidence: (1.0 - distance / baseline).clamp(0.0, 1.0),
             })
         }
-        Question::Noul { .. } => unreachable!(),
+        Question::Noul { .. } | Question::Locate { .. } => unreachable!(),
     }
 }
 
@@ -336,6 +355,9 @@ pub trait Tokenize: Send + Sync {
     /// Token ids of `text` without added special tokens (special tokens written in the text are still matched).
     fn encode(&self, text: &str) -> Result<Vec<u32>, ProtocolError>;
     fn token_to_id(&self, token: &str) -> Option<u32>;
+    /// The same tokens with the characters of `text` each covers (start, end exclusive, in Unicode code points,
+    /// as transformers' `return_offsets_mapping`).
+    fn encode_offsets(&self, text: &str) -> Result<Vec<(u32, (usize, usize))>, ProtocolError>;
 }
 
 impl Tokenize for tokenizers::Tokenizer {
@@ -346,6 +368,11 @@ impl Tokenize for tokenizers::Tokenizer {
     }
     fn token_to_id(&self, token: &str) -> Option<u32> {
         std::ops::Deref::deref(self).token_to_id(token)
+    }
+    fn encode_offsets(&self, text: &str) -> Result<Vec<(u32, (usize, usize))>, ProtocolError> {
+        std::ops::Deref::deref(self).encode_char_offsets(text, false)
+            .map(|encoding| encoding.get_ids().iter().copied().zip(encoding.get_offsets().iter().copied()).collect())
+            .map_err(|error| ProtocolError::Internal(format!("tokenizing: {error}")))
     }
 }
 
@@ -377,6 +404,9 @@ pub struct Encoded {
     pub images: Vec<ImageGrid>,
     /// The images' pixels, in the same order, attached by the server for the model's pass (empty in tests).
     pub pixels: Vec<std::sync::Arc<crate::images::PreparedImage>>,
+    /// Set on a locate sequence (see `crate::locate`), which runs in its own pass with the adapter on; `counts`
+    /// are then zero and `markers` are the `<|locate|>` positions.
+    pub locate: Option<std::sync::Arc<crate::locate::LocateRow>>,
 }
 
 impl Encoded {
@@ -430,6 +460,19 @@ impl Encoder {
         Ok(Self { tokenizer, codes, protocol, marker_id, separator_id, pad_id, image_pad_id, merge_size, escapes })
     }
 
+    /// Also neutralize `token` in user content.
+    pub fn with_escape(mut self, token: &str) -> Self {
+        if !self.escapes.iter().any(|t| t == token) {
+            self.escapes.push(token.to_string());
+            self.escapes.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        }
+        self
+    }
+
+    pub(crate) fn tokenizer(&self) -> &dyn Tokenize {
+        self.tokenizer.as_ref()
+    }
+
     pub fn codes(&self) -> &[String] {
         &self.codes
     }
@@ -439,7 +482,7 @@ impl Encoder {
         Ok(self.tokenizer.encode(text)?.len())
     }
 
-    fn text_of(&self, value: &Value) -> String {
+    pub(crate) fn text_of(&self, value: &Value) -> String {
         let mut text = describe(value);
         for token in &self.escapes {
             if text.contains(token.as_str()) {
@@ -456,6 +499,9 @@ impl Encoder {
         for (key, question) in &request.questions {
             if key.is_empty() {
                 return Err(ProtocolError::Request("Question IDs must be nonempty strings".into()));
+            }
+            if question.is_locate() {
+                return Err(ProtocolError::Internal("A locate question reached the decision encoder".into()));
             }
             let count = options(question).0.len();
             if !(1..=MAX_OPTIONS.min(self.codes.len())).contains(&count) {
@@ -526,6 +572,7 @@ impl Encoder {
             markers,
             images: grids.to_vec(),
             pixels: Vec::new(),
+            locate: None,
         })
     }
 
@@ -613,6 +660,7 @@ impl Encoder {
                 markers: vec![marker],
                 images: grids.to_vec(),
                 pixels: Vec::new(),
+                locate: None,
             });
         }
         for encoded in &plan {
